@@ -1,5 +1,13 @@
 # GPT Pro Review Pack Verification
 
+## Update verification — relation-energy sync, 2026-09-09
+
+This update retains every original tracked file. Eight selected current artifacts were copied byte-for-byte from the original project, and source/destination SHA256 equality was checked. They include the latest brief, cumulative derivation, contract, code, two reports and two raw result files. Four historical reading documents retain their original bodies with explicit version notices. README.md is now the current entry point.
+
+The manifest is refreshed for the current package; it excludes its own hash to avoid circularity. Older experimental evidence remains unchanged. This publishing operation runs no model, training or simulation and adds no private attachments or credentials. The repository is public, as explicitly confirmed by the user before this sync. The original verification below describes the earlier 17-file snapshot, not this updated package.
+
+---
+
 Verification date: 2026-09-09
 
 ## Scope

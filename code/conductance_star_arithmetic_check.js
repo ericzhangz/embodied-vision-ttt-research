@@ -3,6 +3,9 @@
 "use strict";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const relationEnergyOnly = process.argv.includes("--relation-energy-check");
+const relationEnergySelectivityOnly = process.argv.includes("--relation-energy-selectivity-check");
+const noWriteLegacy = process.argv.includes("--no-write-legacy");
 const selectiveCorrectionStageA = process.argv.includes("--selective-correction-stage-a");
 const structureComputationOnly = process.argv.includes("--structure-computation-only") || selectiveCorrectionStageA;
 const constructiveCouplingOnly = process.argv.includes("--constructive-coupling-only") || structureComputationOnly;
@@ -55,6 +58,983 @@ function starFlow(v, a, b, epsilon, axial = p.axial, mismatch = 0, tonic = null,
   }
   return result;
 }
+
+// Shared implicit-cell primitives.  The legacy R/S checks and the relation-
+// energy API both use this same five-state free dynamics and arrowhead solve.
+// The optional weightContext exists only for the frozen legacy Stage A path;
+// the relation-energy path always leaves it null (no history gate).
+const sharedConnectionSigns = [1, -1, -1, 1];
+const sharedZeroState = [0, 0, 0, 0, 0];
+function sharedIncomingWeightData(incoming, Cstar, mode = "full") {
+  assert.ok(mode === "full" || mode === "difference" || mode === "common", "unknown selective weight mode");
+  assert.ok(Number.isFinite(Cstar) && Cstar > 0, "selective contrast scale must be positive");
+  const q = incoming.slice(0, 4).map(value => (value - incoming[4]) ** 2), P = q.reduce((sum, value) => sum + value, 0) / 4;
+  const e = q.map(value => (value - P) / Cstar);
+  const weights = mode === "full"
+    ? e.map((value, j) => 1 + sharedConnectionSigns[j] * value)
+    : mode === "difference"
+      ? e.map((value, j) => sharedConnectionSigns[j] * value)
+      : e.map(() => 1);
+  return {q, P, Cstar, e, weights, mode, connectionSigns: [...sharedConnectionSigns]};
+}
+function sharedResponse(diagonal, edge, rhs) {
+  assert.ok(diagonal.length === 5 && edge.length === 4 && rhs.length === 5, "five-state response shape mismatch");
+  const denominator = diagonal[4] - edge.reduce((sum, g, j) => sum + g * g / diagonal[j], 0);
+  assert.ok(denominator > 0 && diagonal.every(d => d > 0), "response must be positive definite");
+  const soma = (rhs[4] + edge.reduce((sum, g, j) => sum + g * rhs[j] / diagonal[j], 0)) / denominator;
+  return [...edge.map((g, j) => (rhs[j] + g * soma) / diagonal[j]), soma];
+}
+function sharedImplicitCell(th, input, carrier = "axial", incoming = sharedZeroState, tolerance = 1e-12, eps = 0, audit = null, weightContext = null, step = 0.4, maxIterations = 40) {
+  const h = step;
+  assert.ok(carrier === "axial" || carrier === "tonic", "unknown plastic carrier");
+  if (audit !== null) audit.forwardCalls += 1;
+  const weightData = weightContext === null ? null : sharedIncomingWeightData(incoming, weightContext.Cstar, weightContext.mode);
+  const coefficient = th.map((v, j) => (carrier === "axial" ? p.axial : p.leak / 2) * Math.exp(weightData === null ? v : v * weightData.weights[j]));
+  if (!coefficient.every(value => Number.isFinite(value) && value >= 0)) throw new Error(`nonlinear coefficient out of domain: theta=${JSON.stringify(th)} weights=${JSON.stringify(weightData === null ? null : weightData.weights)} coefficient=${JSON.stringify(coefficient)}`);
+  const tonic = carrier === "tonic" ? coefficient : null, cubic = carrier === "axial" ? coefficient : null;
+  const modulation = shuntModulation(input[0], input[1]);
+  const leak = [...modulation.map((m, j) => p.leak + eps * m + (tonic ? tonic[j] - p.leak / 2 : 0)), p.somaLeak];
+  assert.ok(leak.every(g => g > 0), "strictly dissipative leakage required");
+  function system(state) {
+    const drop = state.slice(0, 4).map(v => v - state[4]);
+    const edge = drop.map((d, j) => h * (p.axial + (cubic ? 3 * cubic[j] * d * d : 0)));
+    const diagonal = [...edge.map((g, j) => 1 + h * leak[j] + g), 1 + h * leak[4] + edge.reduce((sum, g) => sum + g, 0)];
+    return {drop, edge, diagonal};
+  }
+  const residual = state => {
+    if (audit !== null) audit.residualEvaluations += 1;
+    const flow = starFlow(state, input[0], input[1], eps, p.axial, 0, tonic, cubic);
+    return state.map((v, j) => v - incoming[j] - h * flow[j]);
+  };
+  let state = [...incoming], iterations = 0;
+  for (; iterations < maxIterations && norm(residual(state)) > tolerance; iterations++) {
+    const r = residual(state), sys = system(state), direction = sharedResponse(sys.diagonal, sys.edge, r);
+    if (audit !== null) {
+      audit.responseCalls += 1;
+      audit.newtonResponseCalls += 1;
+    }
+    let accepted = false;
+    for (let backtrack = 0; backtrack < 24; backtrack++) {
+      const scale = 2 ** (-backtrack), next = state.map((v, j) => v - scale * direction[j]);
+      if (norm(residual(next)) < norm(r)) {
+        state = next;
+        accepted = true;
+        if (audit !== null) audit.backtrackSteps += backtrack;
+        break;
+      }
+    }
+    assert.ok(accepted, "implicit cell Newton step failed; no silent fallback");
+  }
+  if (audit !== null) audit.newtonIterations += iterations;
+  assert.ok(norm(residual(state)) <= tolerance, "implicit cell failed to converge");
+  const result = {state, ...system(state), coefficient, carrier, iterations, residual: norm(residual(state))};
+  return weightData === null ? result : {...result, weights: weightData.weights, weightData};
+}
+
+// ---------------------------------------------------------------------------
+// Relation-energy API (the current primary arithmetic operator).
+// ---------------------------------------------------------------------------
+const relationStateDimension = 5, relationCompartmentCount = 4;
+const relationZero = () => [0, 0, 0, 0, 0];
+const relationDot = (a, b) => a.reduce((sum, value, i) => sum + value * b[i], 0);
+const relationMaxAbs = values => Math.max(...values.map(value => Math.abs(value)));
+const relationGap = (a, b) => relationMaxAbs(a.map((value, i) => value - b[i]));
+const relationAdd = (a, b) => a.map((value, i) => value + b[i]);
+const relationSub = (a, b) => a.map((value, i) => value - b[i]);
+const relationScale = (a, scale) => a.map(value => scale * value);
+const relationFinite = value => Number.isFinite(value);
+const relationFiniteVector = (value, length) => Array.isArray(value) && value.length === length && value.every(relationFinite);
+const relationEuclidean = values => Math.sqrt(relationDot(values, values));
+function relationAssertVector(value, length, name) {
+  assert.ok(relationFiniteVector(value, length), `${name} must be a finite length-${length} vector`);
+}
+function relationAssertTheta(theta) {
+  relationAssertVector(theta, relationCompartmentCount, "theta");
+}
+function relationRecord(record, name, requireY = false) {
+  assert.ok(record !== null && typeof record === "object", `${name} record is required`);
+  relationAssertVector(record.x, 2, `${name}.x`);
+  relationAssertVector(record.incoming, relationStateDimension, `${name}.incoming`);
+  if (requireY) relationAssertVector(record.y, 2, `${name}.y`);
+  if (record.action !== undefined) assert.ok(typeof record.action === "string" && record.action.length > 0, `${name}.action must be explicit`);
+  return record;
+}
+function relationOptions(options = {}) {
+  const h = options.h === undefined ? 0.4 : options.h;
+  const epsilon = options.epsilon === undefined ? 0 : options.epsilon;
+  const gamma = options.gamma === undefined ? 1 : options.gamma;
+  const tau = options.tau === undefined ? 1 : options.tau;
+  const tolerance = options.tolerance === undefined ? 1e-12 : options.tolerance;
+  const maxIterations = options.maxIterations === undefined ? 80 : options.maxIterations;
+  assert.ok(relationFinite(h) && h > 0, "h must be positive and finite");
+  assert.ok(relationFinite(epsilon), "epsilon must be finite");
+  assert.ok(relationFinite(gamma) && gamma >= 0, "gamma must be nonnegative and finite");
+  assert.ok(relationFinite(tau) && tau > 0, "tau must be positive and finite");
+  assert.ok(relationFinite(tolerance) && tolerance > 0, "solver tolerance must be positive and finite");
+  assert.ok(Number.isInteger(maxIterations) && maxIterations >= 0, "maxIterations must be a nonnegative integer");
+  const theta = options.theta === undefined ? [0, 0, 0, 0] : [...options.theta];
+  relationAssertTheta(theta);
+  assert.ok(p.leak > 0 && p.somaLeak > 0 && p.axial > 0 && [p.leak, p.somaLeak, p.axial].every(relationFinite), "base conductances must be positive and finite");
+  return {h, epsilon, gamma, tau, tolerance, maxIterations, theta, energyBias: options.energyBias};
+}
+function relationCoefficients(theta) {
+  relationAssertTheta(theta);
+  const alpha = theta.map(value => p.axial * Math.exp(value));
+  assert.ok(alpha.every(value => relationFinite(value) && value > 0), `alpha=k*exp(theta) must be positive and finite: ${JSON.stringify({theta, alpha})}`);
+  return alpha;
+}
+function relationInput(record) {
+  return [record.x[0], -record.x[0], -record.x[1], record.x[1], 0];
+}
+function relationLeak(record, epsilon) {
+  const modulation = shuntModulation(record.x[0], record.x[1]);
+  const leak = [...modulation.map((value, j) => p.leak + epsilon * value), p.somaLeak];
+  assert.ok(leak.every(value => relationFinite(value) && value > 0), `strictly positive leakage required: ${JSON.stringify({x: record.x, epsilon, leak})}`);
+  return leak;
+}
+function relationStrongConvexityLowerBound(record, options) {
+  return Math.min(...relationLeak(record, options.epsilon).map(value => 1 / options.h + value));
+}
+function relationBias(record, theta, options) {
+  if (options.energyBias === undefined) return 0;
+  const value = typeof options.energyBias === "function" ? options.energyBias(record, theta) : options.energyBias;
+  assert.ok(relationFinite(value), "state-independent energy bias must be finite");
+  return value;
+}
+function relationPotential(record, theta, state, options) {
+  relationRecord(record, "record");
+  relationAssertVector(state, relationStateDimension, "state");
+  const alpha = relationCoefficients(theta), leak = relationLeak(record, options.epsilon), drive = relationInput(record);
+  let value = 0.5 * leak.slice(0, 4).reduce((sum, conductance, j) => sum + conductance * state[j] ** 2, 0) + 0.5 * leak[4] * state[4] ** 2 - relationDot(drive, state);
+  for (let j = 0; j < 4; j++) {
+    const d = state[j] - state[4];
+    value += p.axial * d ** 2 / 2 + alpha[j] * d ** 4 / 4;
+  }
+  return value;
+}
+function relationConditionalEnergy(record, theta, state, incoming, options) {
+  relationRecord(record, "record");
+  relationAssertVector(incoming, relationStateDimension, "incoming");
+  relationAssertVector(state, relationStateDimension, "state");
+  const value = relationDot(relationSub(state, incoming), relationSub(state, incoming)) / (2 * options.h)
+    + relationPotential(record, theta, state, options) + relationBias(record, theta, options);
+  assert.ok(relationFinite(value), "conditional free energy is not finite");
+  return value;
+}
+function relationGradient(record, theta, state, incoming, options) {
+  relationRecord(record, "record");
+  relationAssertVector(incoming, relationStateDimension, "incoming");
+  relationAssertVector(state, relationStateDimension, "state");
+  const alpha = relationCoefficients(theta), leak = relationLeak(record, options.epsilon), drive = relationInput(record);
+  const gradient = state.map((value, i) => (value - incoming[i]) / options.h + leak[i] * value - drive[i]);
+  for (let j = 0; j < 4; j++) {
+    const d = state[j] - state[4], current = p.axial * d + alpha[j] * d ** 3;
+    gradient[j] += current;
+    gradient[4] -= current;
+  }
+  assert.ok(relationFiniteVector(gradient, relationStateDimension), "free-energy gradient is not finite");
+  return gradient;
+}
+function relationHessian(record, theta, state, incoming, options) {
+  relationRecord(record, "record");
+  relationAssertVector(incoming, relationStateDimension, "incoming");
+  relationAssertVector(state, relationStateDimension, "state");
+  const alpha = relationCoefficients(theta), leak = relationLeak(record, options.epsilon);
+  const hessian = Array.from({length: relationStateDimension}, () => Array(relationStateDimension).fill(0));
+  for (let j = 0; j < relationStateDimension; j++) hessian[j][j] = 1 / options.h + leak[j];
+  for (let j = 0; j < 4; j++) {
+    const d = state[j] - state[4], conductance = p.axial + 3 * alpha[j] * d ** 2;
+    hessian[j][j] += conductance;
+    hessian[j][4] -= conductance;
+    hessian[4][j] -= conductance;
+    hessian[4][4] += conductance;
+  }
+  assert.ok(hessian.flat().every(relationFinite), "free-energy Hessian is not finite");
+  return hessian;
+}
+function relationDenseSolve(matrixInput, rhs) {
+  const size = rhs.length;
+  assert.ok(matrixInput.length === size && matrixInput.every(row => Array.isArray(row) && row.length === size), "dense solve shape mismatch");
+  const rows = matrixInput.map((row, i) => [...row, rhs[i]]);
+  for (let column = 0; column < size; column++) {
+    let pivot = column;
+    for (let row = column + 1; row < size; row++) if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row;
+    if (!relationFinite(rows[pivot][column]) || Math.abs(rows[pivot][column]) < 1e-14) throw new Error("singular relation-energy dense solve");
+    [rows[column], rows[pivot]] = [rows[pivot], rows[column]];
+    const scale = rows[column][column];
+    rows[column] = rows[column].map(value => value / scale);
+    for (let row = 0; row < size; row++) if (row !== column) {
+      const factor = rows[row][column];
+      rows[row] = rows[row].map((value, index) => value - factor * rows[column][index]);
+    }
+  }
+  const solution = rows.map(row => row[size]);
+  assert.ok(solution.every(relationFinite), "dense relation-energy solve returned a nonfinite value");
+  return solution;
+}
+function relationPairGradient(query, candidate, theta, state, queryIncoming, candidateIncoming, options) {
+  const queryGradient = relationGradient(query, theta, state.slice(0, 5), queryIncoming, options);
+  const candidateGradient = relationGradient(candidate, theta, state.slice(5), candidateIncoming, options);
+  for (let j = 0; j < 4; j++) {
+    const difference = state[j] - state[5 + j];
+    queryGradient[j] += options.gamma * difference;
+    candidateGradient[j] -= options.gamma * difference;
+  }
+  return [...queryGradient, ...candidateGradient];
+}
+function relationPairHessian(query, candidate, theta, state, queryIncoming, candidateIncoming, options) {
+  const queryHessian = relationHessian(query, theta, state.slice(0, 5), queryIncoming, options);
+  const candidateHessian = relationHessian(candidate, theta, state.slice(5), candidateIncoming, options);
+  const hessian = Array.from({length: 10}, () => Array(10).fill(0));
+  for (let i = 0; i < 5; i++) for (let j = 0; j < 5; j++) {
+    hessian[i][j] = queryHessian[i][j];
+    hessian[5 + i][5 + j] = candidateHessian[i][j];
+  }
+  for (let j = 0; j < 4; j++) {
+    hessian[j][j] += options.gamma;
+    hessian[5 + j][5 + j] += options.gamma;
+    hessian[j][5 + j] -= options.gamma;
+    hessian[5 + j][j] -= options.gamma;
+  }
+  assert.ok(hessian.flat().every(relationFinite), "paired Hessian is not finite");
+  return hessian;
+}
+function relationPairEnergy(query, candidate, theta, state, queryIncoming, candidateIncoming, options) {
+  const queryState = state.slice(0, 5), candidateState = state.slice(5);
+  const portDifference = relationSub(queryState.slice(0, 4), candidateState.slice(0, 4));
+  const value = relationConditionalEnergy(query, theta, queryState, queryIncoming, options)
+    + relationConditionalEnergy(candidate, theta, candidateState, candidateIncoming, options)
+    + options.gamma * relationDot(portDifference, portDifference) / 2;
+  assert.ok(relationFinite(value), "paired energy is not finite");
+  return {value, portDifference, couplingCost: options.gamma * relationDot(portDifference, portDifference) / 2};
+}
+function relationFreeToken(record, theta, options = {}) {
+  const resolved = relationOptions({...options, theta});
+  relationRecord(record, "free");
+  const audit = options.audit || null;
+  const cellTolerance = resolved.tolerance * resolved.h / Math.sqrt(relationStateDimension);
+  const cell = sharedImplicitCell(theta, record.x, "axial", record.incoming, cellTolerance, resolved.epsilon, audit, null, resolved.h, resolved.maxIterations);
+  const alpha = relationCoefficients(theta);
+  assert.ok(relationGap(cell.coefficient, alpha) <= 1e-14, "shared free dynamics did not realize alpha=k*exp(theta)");
+  const energy = relationConditionalEnergy(record, theta, cell.state, record.incoming, resolved);
+  const energyGradient = relationGradient(record, theta, cell.state, record.incoming, resolved);
+  const gradientResidual = relationEuclidean(energyGradient), m = relationStrongConvexityLowerBound(record, resolved), stateErrorUpperBound = gradientResidual / m, energyErrorUpperBound = gradientResidual ** 2 / (2 * m);
+  assert.ok(gradientResidual <= resolved.tolerance, `free state energy-gradient residual exceeds tolerance: ${gradientResidual}`);
+  return {record: relationRecordCopy(record), theta: [...theta], incoming: [...record.incoming], state: [...cell.state], alpha: [...alpha], energy, energyGradient: [...energyGradient], stationarityResidual: gradientResidual, gradientResidual, strongConvexityLowerBound: m, stateErrorUpperBound, energyErrorUpperBound, residual: cell.residual, iterations: cell.iterations, audit, epsilon: resolved.epsilon, h: resolved.h};
+}
+function relationPairTokenWithFree(query, candidate, theta, resolved, queryFree, candidateFree) {
+  relationRecord(query, "query");
+  relationRecord(candidate, "candidate");
+  if (resolved.gamma === 0) {
+    const state = [...queryFree.state, ...candidateFree.state];
+    const gradient = relationPairGradient(query, candidate, theta, state, query.incoming, candidate.incoming, resolved), residual = relationMaxAbs(gradient), gradientResidual = relationEuclidean(gradient), m = Math.min(queryFree.strongConvexityLowerBound, candidateFree.strongConvexityLowerBound);
+    return {query: relationRecordCopy(query), candidate: relationRecordCopy(candidate), state, queryState: [...queryFree.state], candidateState: [...candidateFree.state], energy: queryFree.energy + candidateFree.energy, baseEnergy: queryFree.energy + candidateFree.energy, portDifference: relationSub(queryFree.state.slice(0, 4), candidateFree.state.slice(0, 4)), couplingCost: 0, residual, gradientResidual, strongConvexityLowerBound: m, stateErrorUpperBound: gradientResidual / m, energyErrorUpperBound: gradientResidual ** 2 / (2 * m), iterations: 0, dimension: {query: 5, candidate: 5, total: 10}, unique: true, gamma: 0, queryFree, candidateFree};
+  }
+  let state = [...queryFree.state, ...candidateFree.state], iterations = 0;
+  for (; iterations < resolved.maxIterations; iterations++) {
+    const gradient = relationPairGradient(query, candidate, theta, state, query.incoming, candidate.incoming, resolved), residual = relationMaxAbs(gradient), gradientResidual = relationEuclidean(gradient);
+    if (gradientResidual <= resolved.tolerance) break;
+    const direction = relationDenseSolve(relationPairHessian(query, candidate, theta, state, query.incoming, candidate.incoming, resolved), gradient);
+    const current = relationPairEnergy(query, candidate, theta, state, query.incoming, candidate.incoming, resolved);
+    let accepted = false;
+    for (let backtrack = 0; backtrack < 32; backtrack++) {
+      const scale = 2 ** (-backtrack), next = state.map((value, i) => value - scale * direction[i]);
+      const nextEnergy = relationPairEnergy(query, candidate, theta, next, query.incoming, candidate.incoming, resolved), nextGradient = relationPairGradient(query, candidate, theta, next, query.incoming, candidate.incoming, resolved), nextResidual = relationMaxAbs(nextGradient), nextGradientResidual = relationEuclidean(nextGradient);
+      const energyRoundingTolerance = 64 * Number.EPSILON * Math.max(1, Math.abs(current.value), Math.abs(nextEnergy.value));
+      if (nextGradientResidual < gradientResidual && nextResidual < residual && (nextEnergy.value < current.value || nextEnergy.value <= current.value + energyRoundingTolerance)) {
+        state = next;
+        accepted = true;
+        break;
+      }
+    }
+    assert.ok(accepted, "paired Newton step failed; no silent fallback");
+  }
+  const gradient = relationPairGradient(query, candidate, theta, state, query.incoming, candidate.incoming, resolved), residual = relationMaxAbs(gradient), gradientResidual = relationEuclidean(gradient), m = Math.min(relationStrongConvexityLowerBound(query, resolved), relationStrongConvexityLowerBound(candidate, resolved));
+  assert.ok(gradientResidual <= resolved.tolerance, `paired state energy-gradient residual exceeds tolerance: ${gradientResidual}`);
+  const pairEnergy = relationPairEnergy(query, candidate, theta, state, query.incoming, candidate.incoming, resolved);
+  assert.ok(pairEnergy.couplingCost >= 0 && relationFinite(pairEnergy.couplingCost), "paired coupling cost must be nonnegative and finite");
+  return {query: relationRecordCopy(query), candidate: relationRecordCopy(candidate), state: [...state], queryState: state.slice(0, 5), candidateState: state.slice(5), energy: pairEnergy.value, baseEnergy: pairEnergy.value - relationBias(query, theta, resolved) - relationBias(candidate, theta, resolved), portDifference: [...pairEnergy.portDifference], couplingCost: pairEnergy.couplingCost, residual, gradientResidual, strongConvexityLowerBound: m, stateErrorUpperBound: gradientResidual / m, energyErrorUpperBound: gradientResidual ** 2 / (2 * m), iterations, dimension: {query: 5, candidate: 5, total: 10}, unique: true, gamma: resolved.gamma, queryFree, candidateFree};
+}
+function relationPairToken(query, candidate, theta, options = {}) {
+  assert.ok(!Object.prototype.hasOwnProperty.call(options, "queryFree") && !Object.prototype.hasOwnProperty.call(options, "candidateFree"), "public pairToken does not accept injected free-state caches");
+  const resolved = relationOptions({...options, theta});
+  relationRecord(query, "query");
+  relationRecord(candidate, "candidate");
+  return relationPairTokenWithFree(query, candidate, theta, resolved, relationFreeToken(query, theta, resolved), relationFreeToken(candidate, theta, resolved));
+}
+function relationLocalTerms(pair, queryFree, candidateFree, alpha) {
+  return alpha.map((coefficient, j) => {
+    const pairedQuery = coefficient * (pair.queryState[j] - pair.queryState[4]) ** 4 / 4;
+    const pairedCandidate = coefficient * (pair.candidateState[j] - pair.candidateState[4]) ** 4 / 4;
+    const freeQuery = coefficient * (queryFree.state[j] - queryFree.state[4]) ** 4 / 4;
+    const freeCandidate = coefficient * (candidateFree.state[j] - candidateFree.state[4]) ** 4 / 4;
+    return {pairedQuery, pairedCandidate, freeQuery, freeCandidate, value: pairedQuery + pairedCandidate - freeQuery - freeCandidate};
+  });
+}
+function relationEvaluateAssociation(query, candidate, theta, options, queryFree = null) {
+  const resolved = relationOptions({...options, theta}), freeQuery = queryFree || relationFreeToken(query, theta, resolved), freeCandidate = relationFreeToken(candidate, theta, resolved), pair = relationPairTokenWithFree(query, candidate, theta, resolved, freeQuery, freeCandidate), alpha = relationCoefficients(theta), localTerms = relationLocalTerms(pair, freeQuery, freeCandidate, alpha), value = pair.energy - freeQuery.energy - freeCandidate.energy, e = localTerms.map(term => term.value);
+  assert.ok(relationFinite(value) && relationFiniteVector(e, 4), "association energy or local credit is not finite");
+  assert.ok(value >= -1e-9, `net association energy is negative: ${value}`);
+  return {value, energy: value, e, localTerms, pair, freeQuery, freeCandidate, alpha, gamma: resolved.gamma, tau: resolved.tau};
+}
+function relationAssociationEnergy(query, candidate, theta, options = {}) {
+  relationRecord(query, "query");
+  relationRecord(candidate, "candidate");
+  return relationEvaluateAssociation(query, candidate, theta, options);
+}
+function relationAssociationMargin(query, candidateA, candidateB, theta, options = {}) {
+  relationRecord(query, "query");
+  relationRecord(candidateA, "candidateA");
+  relationRecord(candidateB, "candidateB");
+  const resolved = relationOptions({...options, theta}), freeQuery = relationFreeToken(query, theta, resolved), associationA = relationEvaluateAssociation(query, candidateA, theta, resolved, freeQuery), associationB = relationEvaluateAssociation(query, candidateB, theta, resolved, freeQuery);
+  const value = (associationB.value - associationA.value) / resolved.tau, gradient = associationB.e.map((entry, j) => (entry - associationA.e[j]) / resolved.tau);
+  assert.ok(relationFinite(value) && relationFiniteVector(gradient, 4), "association margin is not finite");
+  return {value, margin: value, gradient, eA: associationA.e, eB: associationB.e, associationA, associationB, queryFree: freeQuery, tau: resolved.tau, gamma: resolved.gamma};
+}
+function relationArrowheadParts(hessian) {
+  assert.ok(Array.isArray(hessian) && hessian.length === 5 && hessian.every(row => Array.isArray(row) && row.length === 5), "arrowhead Hessian shape mismatch");
+  const diagonal = hessian.map((row, j) => row[j]), edge = hessian.slice(0, 4).map(row => -row[4]);
+  assert.ok(diagonal.every(value => relationFinite(value)) && edge.every(value => relationFinite(value)), "arrowhead Hessian is nonfinite");
+  return {diagonal, edge};
+}
+function relationFreeThetaJacobian(record, theta, free, options) {
+  const hessian = relationHessian(record, theta, free.state, record.incoming, options), {diagonal, edge} = relationArrowheadParts(hessian), jacobian = Array.from({length: relationStateDimension}, () => Array(relationCompartmentCount).fill(0));
+  for (let parameter = 0; parameter < relationCompartmentCount; parameter++) {
+    const d = free.state[parameter] - free.state[4], source = Array(relationStateDimension).fill(0), partialGradient = free.alpha[parameter] * d ** 3;
+    source[parameter] = -partialGradient;
+    source[4] = partialGradient;
+    const derivative = sharedResponse(diagonal, edge, source);
+    for (let stateIndex = 0; stateIndex < relationStateDimension; stateIndex++) jacobian[stateIndex][parameter] = derivative[stateIndex];
+  }
+  assert.ok(jacobian.flat().every(relationFinite), "free-state theta Jacobian is nonfinite");
+  return {jacobian, responseSolves: relationCompartmentCount};
+}
+function relationDistanceFreeBundle(record, theta, options) {
+  const free = relationFreeToken(record, theta, options), derivative = relationFreeThetaJacobian(record, theta, free, options);
+  return {free, jacobian: derivative.jacobian, responseSolves: derivative.responseSolves};
+}
+function relationDistanceAssociationFromBundles(queryBundle, candidateBundle, options) {
+  const portDifference = relationSub(queryBundle.free.state.slice(0, 4), candidateBundle.free.state.slice(0, 4)), value = options.gamma * relationDot(portDifference, portDifference) / 2, gradient = Array(relationCompartmentCount).fill(0);
+  for (let parameter = 0; parameter < relationCompartmentCount; parameter++) {
+    const portDerivative = queryBundle.jacobian.slice(0, 4).map((row, j) => row[parameter] - candidateBundle.jacobian[j][parameter]);
+    gradient[parameter] = options.gamma * relationDot(portDifference, portDerivative);
+  }
+  assert.ok(relationFinite(value) && relationFiniteVector(gradient, relationCompartmentCount), "distance association is nonfinite");
+  return {value, gradient, portDifference};
+}
+function relationDistanceMargin(query, candidateA, candidateB, theta, options = {}) {
+  const resolved = relationOptions({...options, theta}), queryBundle = relationDistanceFreeBundle(query, theta, resolved), candidateABundle = relationDistanceFreeBundle(candidateA, theta, resolved), candidateBBundle = relationDistanceFreeBundle(candidateB, theta, resolved), associationA = relationDistanceAssociationFromBundles(queryBundle, candidateABundle, resolved), associationB = relationDistanceAssociationFromBundles(queryBundle, candidateBBundle, resolved), value = (associationB.value - associationA.value) / resolved.tau, gradient = associationB.gradient.map((entry, j) => (entry - associationA.gradient[j]) / resolved.tau), newtonIterations = queryBundle.free.iterations + candidateABundle.free.iterations + candidateBBundle.free.iterations;
+  assert.ok(relationFinite(value) && relationFiniteVector(gradient, relationCompartmentCount), "distance margin is nonfinite");
+  return {value, margin: value, gradient, associationA, associationB, queryFree: queryBundle.free, solveSummary: {freeSolves: 3, pairSolves: 0, linearResponseSolves: queryBundle.responseSolves + candidateABundle.responseSolves + candidateBBundle.responseSolves, totalSolverCalls: 3, newtonIterations}};
+}
+function relationEnergyMarginValueOnly(query, candidateA, candidateB, theta, options = {}) {
+  const resolved = relationOptions({...options, theta}), queryFree = relationFreeToken(query, theta, resolved), candidateAFree = relationFreeToken(candidateA, theta, resolved), candidateBFree = relationFreeToken(candidateB, theta, resolved), pairA = relationPairTokenWithFree(query, candidateA, theta, resolved, queryFree, candidateAFree), pairB = relationPairTokenWithFree(query, candidateB, theta, resolved, queryFree, candidateBFree), valueA = pairA.energy - queryFree.energy - candidateAFree.energy, valueB = pairB.energy - queryFree.energy - candidateBFree.energy, value = (valueB - valueA) / resolved.tau;
+  assert.ok(relationFinite(value), "value-only relation margin is nonfinite");
+  return {value, solveSummary: {freeSolves: 3, pairSolves: 2, linearResponseSolves: 0, totalSolverCalls: 5, newtonIterations: queryFree.iterations + candidateAFree.iterations + candidateBFree.iterations + pairA.iterations + pairB.iterations}};
+}
+function relationDistanceMarginValueOnly(query, candidateA, candidateB, theta, options = {}) {
+  const resolved = relationOptions({...options, theta}), queryFree = relationFreeToken(query, theta, resolved), candidateAFree = relationFreeToken(candidateA, theta, resolved), candidateBFree = relationFreeToken(candidateB, theta, resolved), portA = relationSub(queryFree.state.slice(0, 4), candidateAFree.state.slice(0, 4)), portB = relationSub(queryFree.state.slice(0, 4), candidateBFree.state.slice(0, 4)), valueA = resolved.gamma * relationDot(portA, portA) / 2, valueB = resolved.gamma * relationDot(portB, portB) / 2, value = (valueB - valueA) / resolved.tau;
+  assert.ok(relationFinite(value), "value-only distance margin is nonfinite");
+  return {value, solveSummary: {freeSolves: 3, pairSolves: 0, linearResponseSolves: 0, totalSolverCalls: 3, newtonIterations: queryFree.iterations + candidateAFree.iterations + candidateBFree.iterations}};
+}
+function relationLogSumExp(values) {
+  assert.ok(values.length > 0 && values.every(relationFinite), "logSumExp inputs must be finite");
+  const maximum = Math.max(...values), sum = values.reduce((total, value) => total + Math.exp(value - maximum), 0);
+  const result = maximum + Math.log(sum);
+  assert.ok(relationFinite(result), "logSumExp returned a nonfinite value");
+  return result;
+}
+function relationSigmoid(value) {
+  assert.ok(relationFinite(value), "sigmoid input must be finite");
+  return value >= 0 ? 1 / (1 + Math.exp(-value)) : Math.exp(value) / (1 + Math.exp(value));
+}
+function relationLogSigmoid(value) {
+  assert.ok(relationFinite(value), "log-sigmoid input must be finite");
+  return value >= 0 ? -Math.log1p(Math.exp(-value)) : value - Math.log1p(Math.exp(value));
+}
+function relationSigmoidDelta(value, increment) {
+  assert.ok(relationFinite(value) && relationFinite(increment), "sigmoid delta inputs must be finite");
+  if (increment === 0) return 0;
+  const shifted = value + increment, logBefore = relationLogSigmoid(value), logAfter = relationLogSigmoid(shifted);
+  if (increment > 0) return Math.exp(logAfter) * (-Math.expm1(logBefore - logAfter));
+  return Math.exp(logBefore) * Math.expm1(logAfter - logBefore);
+}
+function relationLogLikelihood(y, mean, variance) {
+  const residual = relationSub(y, mean), squared = relationDot(residual, residual);
+  assert.ok(relationFinite(squared), "teacher residual square is not finite");
+  const value = -0.5 * (y.length * Math.log(2 * Math.PI * variance) + squared / variance);
+  assert.ok(relationFinite(value), "teacher log likelihood is not finite");
+  return {residual, squared, logLikelihood: value};
+}
+function relationFreezeTeacherSpec(teacherSpec, requireGaussianOutside = false) {
+  assert.ok(teacherSpec !== null && typeof teacherSpec === "object", "coverage teacher specification is required");
+  assert.ok(typeof teacherSpec.version === "string" && teacherSpec.version.length > 0, "teacher version must be a nonempty string");
+  const pi0 = teacherSpec.pi0, variance = teacherSpec.variance === undefined ? 1 : teacherSpec.variance;
+  assert.ok(relationFinite(pi0) && pi0 > 0 && pi0 < 1, "pi0 must be in (0,1)");
+  assert.ok(relationFinite(variance) && variance > 0, "teacher variance must be positive and finite");
+  let emptyMean = teacherSpec.emptyMean;
+  let emptyVariance = teacherSpec.emptyVariance;
+  if (teacherSpec.outside !== undefined) {
+    assert.ok(teacherSpec.outside !== null && typeof teacherSpec.outside === "object", "outside teacher specification must be an object");
+    emptyMean = teacherSpec.outside.mean;
+    emptyVariance = teacherSpec.outside.variance;
+  }
+  if (requireGaussianOutside || emptyMean !== undefined || emptyVariance !== undefined) {
+    relationAssertVector(emptyMean, 2, "emptyMean");
+    assert.ok(relationFinite(emptyVariance) && emptyVariance > 0, "emptyVariance must be positive and finite");
+  }
+  let logEmptyLikelihood = teacherSpec.logEmptyLikelihood;
+  if (logEmptyLikelihood !== undefined) {
+    assert.ok(typeof logEmptyLikelihood === "number" && relationFinite(logEmptyLikelihood), "logEmptyLikelihood must be a finite number");
+  }
+  assert.ok(teacherSpec.emptyLikelihood === undefined, "emptyLikelihood is not an accepted teacher input; use finite logEmptyLikelihood or Gaussian outside");
+  if (requireGaussianOutside) assert.ok(logEmptyLikelihood === undefined, "online Gaussian outside model cannot also provide logEmptyLikelihood");
+  if (requireGaussianOutside) assert.ok(emptyMean !== undefined && emptyVariance !== undefined, "online pending requires a frozen Gaussian outside model");
+  return Object.freeze({version: teacherSpec.version, pi0, variance, emptyMean: emptyMean === undefined ? undefined : Object.freeze([...emptyMean]), emptyVariance, logEmptyLikelihood});
+}
+function relationCoverageTeacher(pending, arrival, teacherSpec) {
+  assert.ok(pending !== null && typeof pending === "object", "pending event is required");
+  assert.ok(arrival !== null && typeof arrival === "object", "arrival record is required");
+  relationAssertVector(arrival.y, 2, "arrival.y");
+  const frozen = relationFreezeTeacherSpec(teacherSpec, false), pi0 = frozen.pi0, variance = frozen.variance;
+  const w = relationSub(arrival.y, pending.queryRecord.x), likelihoodA = relationLogLikelihood(arrival.y, pending.muA, variance), likelihoodB = relationLogLikelihood(arrival.y, pending.muB, variance);
+  let logEmpty;
+  if (frozen.logEmptyLikelihood !== undefined) logEmpty = frozen.logEmptyLikelihood;
+  else if (frozen.emptyMean !== undefined) logEmpty = relationLogLikelihood(arrival.y, frozen.emptyMean, frozen.emptyVariance).logLikelihood;
+  else throw new Error("coverage teacher requires an explicit finite log density or frozen Gaussian outside model");
+  assert.ok(relationFinite(logEmpty), "logEmptyLikelihood must be finite");
+  const f = pending.margin, pBefore = relationSigmoid(f), lambda = likelihoodA.logLikelihood - likelihoodB.logLikelihood, pPlus = relationSigmoid(f + lambda);
+  const logPBefore = relationLogSigmoid(f), logOneMinusPBefore = relationLogSigmoid(-f), logMixture = relationLogSumExp([logPBefore + likelihoodA.logLikelihood, logOneMinusPBefore + likelihoodB.logLikelihood]);
+  const logEvidence = relationLogSumExp([Math.log1p(-pi0) + logMixture, Math.log(pi0) + logEmpty]), logCoverageMass = Math.log1p(-pi0) + logMixture - logEvidence, omega = Math.exp(logCoverageMass), delta = omega * relationSigmoidDelta(f, lambda);
+  const result = {y: [...arrival.y], w, residualA: likelihoodA.residual, residualB: likelihoodB.residual, squaredResidualA: likelihoodA.squared, squaredResidualB: likelihoodB.squared, logEllA: likelihoodA.logLikelihood, logEllB: likelihoodB.logLikelihood, logEmptyLikelihood: logEmpty, lambda, pBefore, pPlus, logMixture, logEvidence, loss: -logEvidence, omega, delta, derivativeOfLossWrtMargin: -delta, pi0, variance, teacherVersion: frozen.version, deltaNumerics: "stable log-sigmoid difference using expm1"};
+  assert.ok(Object.values(result).filter(value => typeof value === "number").every(relationFinite), "coverage teacher returned a nonfinite scalar");
+  return result;
+}
+function relationRecordCopy(record, includeY = true) {
+  const copy = {...record, x: [...record.x], incoming: [...record.incoming]};
+  if (includeY && record.y !== undefined) copy.y = [...record.y];
+  if (!includeY) delete copy.y;
+  return copy;
+}
+function relationTransition(record, query) {
+  relationRecord(record, "candidate", true);
+  relationRecord(query, "query");
+  assert.ok(typeof record.id === "string" && record.id.length > 0, "candidate id must be a nonempty string");
+  assert.ok(typeof record.recordVersion === "string" && record.recordVersion.length > 0, "candidate recordVersion must be explicit");
+  assert.ok(record.completed === true && Number.isInteger(record.arrival) && record.arrival >= 0, "candidate record must be a completed record with an arrival sequence");
+  assert.ok(typeof query.action === "string" && query.action.length > 0, "query action must be explicit and nonempty");
+  assert.ok(record.action === query.action, "candidate and query actions must be explicit and equal");
+  const increment = relationSub(record.y, record.x);
+  return {candidateId: record.id, action: record.action, increment, mu: relationAdd(query.x, increment)};
+}
+function relationCreatePending(spec) {
+  assert.ok(spec !== null && typeof spec === "object", "pending specification is required");
+  relationRecord(spec.queryRecord, "queryRecord");
+  relationRecord(spec.candidateA, "candidateA", true);
+  relationRecord(spec.candidateB, "candidateB", true);
+  assert.ok(typeof spec.eventId === "string" && spec.eventId.length > 0, "eventId must be nonempty");
+  assert.ok(Number.isInteger(spec.thetaVersion) && spec.thetaVersion >= 0, "thetaVersion must be a nonnegative integer");
+  assert.ok(spec.queryRecord.completed === false && spec.queryRecord.arrival === null, "query record must be the current incomplete record with no arrival sequence");
+  assert.ok(typeof spec.queryRecord.recordVersion === "string" && spec.queryRecord.recordVersion.length > 0, "query recordVersion must be explicit");
+  assert.ok(Number.isInteger(spec.queryRecord.observedAt) && spec.queryRecord.observedAt >= 0, "query observedAt must be a nonnegative integer");
+  assert.ok(spec.candidateA.arrival <= spec.queryRecord.observedAt && spec.candidateB.arrival <= spec.queryRecord.observedAt, "candidate completion cannot be after query observedAt");
+  assert.ok(spec.candidateA.id !== spec.candidateB.id, "candidate ids must be distinct");
+  assert.ok(spec.options === undefined || typeof spec.options.energyBias !== "function", "pending relation does not accept mutable energy-bias callbacks");
+  const teacherSpec = relationFreezeTeacherSpec(spec.teacherSpec, true), theta = [...spec.theta];
+  relationAssertTheta(theta);
+  const options = relationOptions({...spec.options, theta}), computed = relationAssociationMargin(spec.queryRecord, spec.candidateA, spec.candidateB, theta, options), predictionA = relationTransition(spec.candidateA, spec.queryRecord), predictionB = relationTransition(spec.candidateB, spec.queryRecord);
+  const frozenQuery = relationFrozenRecordCopy(spec.queryRecord, false), frozenA = relationFrozenRecordCopy(spec.candidateA), frozenB = relationFrozenRecordCopy(spec.candidateB);
+  const pending = {
+    eventId: spec.eventId,
+    thetaVersion: spec.thetaVersion,
+    thetaSnapshot: Object.freeze([...theta]),
+    action: spec.queryRecord.action,
+    teacherVersion: teacherSpec.version,
+    teacherSpec,
+    candidateIds: Object.freeze([spec.candidateA.id, spec.candidateB.id]),
+    candidateRecordVersions: Object.freeze({A: spec.candidateA.recordVersion, B: spec.candidateB.recordVersion}),
+    queryRecordVersion: spec.queryRecord.recordVersion,
+    historySourceVersions: Object.freeze({query: spec.queryRecord.recordVersion, A: spec.candidateA.recordVersion, B: spec.candidateB.recordVersion}),
+    candidateRecords: Object.freeze({A: frozenA, B: frozenB}),
+    queryRecord: frozenQuery,
+    incoming: Object.freeze([...spec.queryRecord.incoming]),
+    muA: Object.freeze([...predictionA.mu]),
+    muB: Object.freeze([...predictionB.mu]),
+    incrementA: Object.freeze([...predictionA.increment]),
+    incrementB: Object.freeze([...predictionB.increment]),
+    margin: computed.value,
+    marginGradient: Object.freeze([...computed.gradient]),
+    eA: Object.freeze([...computed.eA]),
+    eB: Object.freeze([...computed.eB]),
+    associationSummary: Object.freeze({A: {value: computed.associationA.value, e: Object.freeze([...computed.associationA.e]), localTerms: Object.freeze(computed.associationA.localTerms.map(term => Object.freeze({...term})))}, B: {value: computed.associationB.value, e: Object.freeze([...computed.associationB.e]), localTerms: Object.freeze(computed.associationB.localTerms.map(term => Object.freeze({...term})))}}),
+    options: Object.freeze({h: options.h, epsilon: options.epsilon, gamma: options.gamma, tau: options.tau, tolerance: options.tolerance, maxIterations: options.maxIterations, ...(typeof options.energyBias === "number" ? {energyBias: options.energyBias} : {})}),
+    consumed: false,
+  };
+  return relationLockPendingSnapshot(pending);
+}
+function relationFrozenRecordCopy(record, includeY = true) {
+  const copy = relationRecordCopy(record, includeY);
+  Object.freeze(copy.x);
+  Object.freeze(copy.incoming);
+  if (copy.y !== undefined) Object.freeze(copy.y);
+  return Object.freeze(copy);
+}
+function relationLockPendingSnapshot(pending) {
+  for (const key of ["eventId", "thetaVersion", "thetaSnapshot", "action", "teacherVersion", "teacherSpec", "candidateIds", "candidateRecordVersions", "queryRecordVersion", "historySourceVersions", "candidateRecords", "queryRecord", "incoming", "muA", "muB", "incrementA", "incrementB", "margin", "marginGradient", "eA", "eB", "associationSummary", "options"]) {
+    Object.defineProperty(pending, key, {value: pending[key], enumerable: true, writable: false, configurable: false});
+  }
+  return pending;
+}
+function relationCreateOnlineState({theta, thetaVersion = 0, liveState = relationZero()} = {}) {
+  relationAssertTheta(theta);
+  assert.ok(Number.isInteger(thetaVersion) && thetaVersion >= 0, "thetaVersion must be a nonnegative integer");
+  relationAssertVector(liveState, 5, "liveState");
+  return {theta: [...theta], thetaVersion, liveState: [...liveState], pending: null, consumedEventIds: []};
+}
+function relationBeginPending(session, spec) {
+  assert.ok(session !== null && typeof session === "object", "online state is required");
+  assert.equal(session.pending, null, "only one pending relation event is allowed");
+  const pending = relationCreatePending({...spec, theta: session.theta, thetaVersion: session.thetaVersion});
+  session.pending = pending;
+  return pending;
+}
+function relationConsumePending(session, arrival, teacherSpec, eta) {
+  assert.ok(session !== null && typeof session === "object", "online state is required");
+  assert.ok(arrival !== null && typeof arrival === "object" && typeof arrival.eventId === "string", "arrival eventId is required");
+  relationAssertVector(arrival.y, 2, "arrival.y");
+  assert.ok(Number.isInteger(arrival.arrival) && arrival.arrival >= 0, "query arrival sequence must be explicit and nonnegative");
+  assert.ok(typeof arrival.action === "string" && arrival.action.length > 0, "arrival action must be explicit and nonempty");
+  assert.ok(typeof arrival.teacherVersion === "string" && arrival.teacherVersion.length > 0, "arrival teacher version must be explicit");
+  if (session.consumedEventIds.includes(arrival.eventId)) throw new Error("duplicate arrival already consumed");
+  assert.ok(session.pending !== null, "no pending relation event");
+  const pending = session.pending;
+  assert.equal(arrival.eventId, pending.eventId, "arrival eventId does not match the pending event");
+  assert.equal(pending.thetaVersion, session.thetaVersion, "pending theta version mismatch");
+  assert.ok(relationGap(session.theta, pending.thetaSnapshot) === 0, "pending theta value snapshot mismatch");
+  assert.equal(arrival.action, pending.action, "arrival action does not match the pending action");
+  assert.equal(arrival.teacherVersion, pending.teacherVersion, "arrival teacher version mismatch");
+  const latestCandidateArrival = Math.max(pending.candidateRecords.A.arrival, pending.candidateRecords.B.arrival);
+  assert.ok(arrival.arrival > latestCandidateArrival, "query arrival must follow completed candidate arrivals");
+  assert.ok(arrival.arrival > pending.queryRecord.observedAt, "query arrival must follow query observedAt");
+  if (teacherSpec !== undefined && teacherSpec !== null) {
+    const suppliedTeacher = relationFreezeTeacherSpec(teacherSpec, true);
+    assert.deepEqual(suppliedTeacher, pending.teacherSpec, "supplied teacher spec does not match the frozen pending teacher");
+  }
+  assert.ok(relationFinite(eta) && eta > 0, "eta must be positive and finite");
+  const evidence = relationCoverageTeacher(pending, arrival, pending.teacherSpec), deltaTheta = pending.marginGradient.map(value => eta * evidence.delta * value);
+  assert.ok(relationFiniteVector(deltaTheta, 4), "parameter write is not finite");
+  const thetaBefore = [...session.theta], thetaAfter = relationAdd(session.theta, deltaTheta);
+  assert.ok(relationFiniteVector(thetaAfter, 4), "updated theta is not finite");
+  relationCoefficients(thetaAfter);
+  pending.consumed = true;
+  pending.arrivalRecord = {eventId: arrival.eventId, y: [...arrival.y], arrival: arrival.arrival, action: arrival.action, teacherVersion: arrival.teacherVersion};
+  pending.evidence = evidence;
+  pending.deltaTheta = deltaTheta;
+  pending.thetaBefore = thetaBefore;
+  pending.thetaAfter = thetaAfter;
+  pending.thetaVersionAfter = session.thetaVersion + 1;
+  session.theta = thetaAfter;
+  session.thetaVersion += 1;
+  session.consumedEventIds.push(arrival.eventId);
+  session.pending = null;
+  return {thetaBefore, thetaAfter, thetaVersionAfter: session.thetaVersion, evidence, deltaTheta, pending};
+}
+
+const freeToken = relationFreeToken;
+const pairToken = relationPairToken;
+const associationEnergy = relationAssociationEnergy;
+const associationMargin = relationAssociationMargin;
+const coverageTeacher = relationCoverageTeacher;
+const createOnlineState = relationCreateOnlineState;
+const beginRelationPending = relationBeginPending;
+const consumeRelationPending = relationConsumePending;
+
+function runRelationEnergyCheck() {
+  const checks = [];
+  const recordCheck = (name, passed, details = {}) => {
+    const row = {name, passed: Boolean(passed), ...details};
+    checks.push(row);
+    return row.passed;
+  };
+  const tryError = operation => {
+    try { operation(); return {threw: false, error: null}; }
+    catch (error) { return {threw: true, error: String(error.message || error)}; }
+  };
+  const options = {h: 0.4, epsilon: 0, gamma: 1, tau: 1, tolerance: 1e-12, maxIterations: 80};
+  const theta = [0.18, -0.11, 0.07, -0.05];
+  const cold = relationZero();
+  const warmHistory = (id, prefix) => {
+    let incoming = [...cold];
+    const steps = [];
+    for (const x of prefix) {
+      const record = {id: `${id}_${steps.length}`, x, incoming, recordVersion: `${id}-history-v1`};
+      const free = freeToken(record, theta, options);
+      steps.push({x: [...x], incoming: [...incoming], state: free.state, residual: free.residual});
+      incoming = [...free.state];
+    }
+    return {id, prefix, incoming, steps};
+  };
+  const histories = {
+    query: warmHistory("Q", [[1, 0], [0, 0.8], [-0.6, 0.2]]),
+    A: warmHistory("A", [[0, 1], [0.7, -0.4], [0.2, 0.9]]),
+    B: warmHistory("B", [[-0.8, 0.3], [0.4, 0.9], [-0.2, -0.7]]),
+  };
+  const query = {id: "query", x: [0.8, 0.2], action: "forward", arrival: null, completed: false, observedAt: 2, recordVersion: "query-live-v1", incoming: [...histories.query.incoming]};
+  const candidateA = {id: "A", x: [0.3, 0.7], y: [0.4, 0.7], action: "forward", arrival: 1, completed: true, recordVersion: "candidate-A-v1", incoming: [...histories.A.incoming]};
+  const candidateB = {id: "B", x: [0.7, -0.2], y: [0.6, -0.2], action: "forward", arrival: 2, completed: true, recordVersion: "candidate-B-v1", incoming: [...histories.B.incoming]};
+  const freeQuery = freeToken(query, theta, options), expectedAlpha = theta.map(value => p.axial * Math.exp(value));
+  recordCheck("Eq1 alpha is exactly k*exp(theta), finite and strictly positive, with no w field", relationGap(freeQuery.alpha, expectedAlpha) <= 1e-14 && freeQuery.alpha.every(value => value > 0 && relationFinite(value)) && !Object.prototype.hasOwnProperty.call(freeQuery, "weights"), {alpha: freeQuery.alpha, theta, k: p.axial});
+  recordCheck("Eq2/Eq3 free conditional energy has a finite stationary solution", freeQuery.stationarityResidual <= 1e-9 && freeQuery.residual <= options.tolerance && relationFinite(freeQuery.energy), {energy: freeQuery.energy, stationarityResidual: freeQuery.stationarityResidual, residual: freeQuery.residual, histories});
+  const associationA = associationEnergy(query, candidateA, theta, options), associationB = associationEnergy(query, candidateB, theta, options), margin = associationMargin(query, candidateA, candidateB, theta, options);
+  const pair = associationA.pair;
+  recordCheck("Eq8 A paired operator uses fixed S=[I4 0], two 5-state cells and a converged unique 10-state solve", pair.dimension.total === 10 && pair.dimension.query === 5 && pair.dimension.candidate === 5 && pair.unique && pair.residual <= options.tolerance && pair.portDifference.length === 4 && pair.couplingCost >= 0, {dimension: pair.dimension, port: "S=[I4 0]", gamma: options.gamma, pairResidual: pair.residual, pairGradientResidual: pair.gradientResidual, pairIterations: pair.iterations, portDifference: pair.portDifference, couplingCost: pair.couplingCost, stateErrorUpperBound: pair.stateErrorUpperBound, energyErrorUpperBound: pair.energyErrorUpperBound});
+  recordCheck("Eq8 A net association energy is nonnegative for both candidates", associationA.value >= -1e-10 && associationB.value >= -1e-10 && associationA.pair.couplingCost >= 0 && associationB.pair.couplingCost >= 0, {A: associationA.value, B: associationB.value, couplingA: associationA.pair.couplingCost, couplingB: associationB.pair.couplingCost});
+  recordCheck("Eq11 e contains all four paired/free query/candidate terms", associationA.localTerms.length === 4 && associationB.localTerms.length === 4 && associationA.localTerms.every(term => [term.pairedQuery, term.pairedCandidate, term.freeQuery, term.freeCandidate, term.value].every(relationFinite)) && relationFiniteVector(associationA.e, 4) && relationFiniteVector(associationB.e, 4), {eA: associationA.e, eB: associationB.e, localTermsA: associationA.localTerms, localTermsB: associationB.localTerms});
+  recordCheck("Eq13 g uses f=(A_B-A_A)/tau and g=(e_B-e_A)/tau", Math.abs(margin.value - (associationB.value - associationA.value) / options.tau) <= 1e-14 && relationGap(margin.gradient, associationB.e.map((value, j) => (value - associationA.e[j]) / options.tau)) <= 1e-14, {f: margin.value, A_A: associationA.value, A_B: associationB.value, tau: options.tau, gradient: margin.gradient});
+  const fdSteps = [1e-4, 3e-5, 1e-5], finiteDifferences = fdSteps.map(step => {
+    const finite = theta.map((_, j) => {
+      const plus = [...theta], minus = [...theta]; plus[j] += step; minus[j] -= step;
+      return (associationMargin(query, candidateA, candidateB, plus, options).value - associationMargin(query, candidateA, candidateB, minus, options).value) / (2 * step);
+    });
+    return {step, finite, absoluteGap: relationGap(finite, margin.gradient)};
+  });
+  const analyticGradientNorm = relationEuclidean(margin.gradient);
+  const options05 = {...options, epsilon: 0.05}, margin05 = associationMargin(query, candidateA, candidateB, theta, options05), finite05 = theta.map((_, j) => {
+    const plus = [...theta], minus = [...theta]; plus[j] += 1e-5; minus[j] -= 1e-5;
+    return (associationMargin(query, candidateA, candidateB, plus, options05).value - associationMargin(query, candidateA, candidateB, minus, options05).value) / 2e-5;
+  });
+  const finiteDifferencesWithRelative = finiteDifferences.map(row => ({...row, relativeGap: row.absoluteGap / Math.max(analyticGradientNorm, Number.MIN_VALUE)}));
+  const finite05Gap = relationGap(finite05, margin05.gradient), finite05RelativeGap = finite05Gap / Math.max(relationEuclidean(margin05.gradient), Number.MIN_VALUE);
+  recordCheck("Eq11 e/Eq13 g analytic gradient matches FD with incoming frozen, full re-solves, nonzero norm and epsilon=.05", analyticGradientNorm > 1e-6 && finiteDifferencesWithRelative.every(row => row.relativeGap <= 2e-7) && finite05RelativeGap <= 2e-7 && relationEuclidean(margin05.gradient) > 1e-6, {theta, frozenIncoming: true, analyticGradientNorm, finiteDifferences: finiteDifferencesWithRelative, analytic: margin.gradient, epsilon05: {analytic: margin05.gradient, gradientNorm: relationEuclidean(margin05.gradient), finite: finite05, absoluteGap: finite05Gap, relativeGap: finite05RelativeGap}});
+  const swapped = associationEnergy(candidateA, query, theta, options);
+  recordCheck("Eq8 A complete-record exchange symmetry holds", Math.abs(swapped.value - associationA.value) <= 2e-10, {forward: associationA.value, swapped: swapped.value, gap: Math.abs(swapped.value - associationA.value)});
+  const biasOptions = {...options, energyBias: (record, th) => (record.id === "query" ? 3.1 : record.id === "A" ? -2.4 : 1.7) + relationDot(th, th)};
+  const biasedMargin = associationMargin(query, candidateA, candidateB, theta, biasOptions);
+  recordCheck("Eq8 A state-independent per-record energy biases cancel from A and its gradient", Math.abs(biasedMargin.value - margin.value) <= 2e-10 && relationGap(biasedMargin.gradient, margin.gradient) <= 2e-9, {unbiased: margin.value, biased: biasedMargin.value, gradientGap: relationGap(biasedMargin.gradient, margin.gradient)});
+  const gammaZero = associationMargin(query, candidateA, candidateB, theta, {...options, gamma: 0});
+  recordCheck("gamma=0 is a numerical habit control with actual port differences and energy residuals", Math.abs(gammaZero.value) <= 1e-12 && relationGap(gammaZero.associationA.pair.portDifference, relationSub(gammaZero.associationA.pair.queryState.slice(0, 4), gammaZero.associationA.pair.candidateState.slice(0, 4))) <= 1e-15 && relationFinite(gammaZero.associationA.pair.residual) && relationFinite(gammaZero.associationA.pair.gradientResidual) && gammaZero.associationA.pair.couplingCost === 0 && gammaZero.associationB.pair.couplingCost === 0, {margin: gammaZero.value, gradient: gammaZero.gradient, eA: gammaZero.eA, eB: gammaZero.eB, portDifferenceA: gammaZero.associationA.pair.portDifference, residualA: gammaZero.associationA.pair.residual, gradientResidualA: gammaZero.associationA.pair.gradientResidual});
+  const pendingSpec = {eventId: "E0", queryRecord: query, candidateA, candidateB, teacherSpec: {version: "teacher-fixture-v1", pi0: 0.1, variance: 1, emptyMean: [2.5, -2.5], emptyVariance: 1}};
+  const teacherFixture = {version: "teacher-fixture-v1", pi0: 0.1, variance: 1, emptyMean: [2.5, -2.5], emptyVariance: 1};
+  const pending = relationCreatePending({...pendingSpec, theta, thetaVersion: 0, options});
+  const arrival = {eventId: "E0", y: [0.9, 0.2], arrival: 3, action: "forward", teacherVersion: "teacher-fixture-v1"};
+  const evidence = coverageTeacher(pending, arrival, teacherFixture);
+  const teacherLossAtMargin = marginValue => coverageTeacher({...pending, margin: marginValue}, arrival, teacherFixture).loss;
+  const teacherFd = [1e-4, 1e-5].map(step => {
+    const finite = (teacherLossAtMargin(pending.margin + step) - teacherLossAtMargin(pending.margin - step)) / (2 * step), analytic = evidence.derivativeOfLossWrtMargin;
+    return {step, finite, analytic, absoluteGap: Math.abs(finite - analytic), relativeGap: Math.abs(finite - analytic) / Math.max(Math.abs(analytic), Number.MIN_VALUE)};
+  });
+  const extremeTeacher = [40, 100, -1000].map((value, index) => coverageTeacher({...pending, margin: value}, {...arrival, eventId: `E_extreme_${index}`}, teacherFixture));
+  const algebraicTeacher = {version: "teacher-log-algebra-v1", pi0: 0.1, variance: 1, logEmptyLikelihood: -3};
+  const algebraicEvidence = coverageTeacher(pending, arrival, algebraicTeacher);
+  const frozenTeacherMutation = tryError(() => { pending.teacherSpec.emptyMean[0] = 99; });
+  recordCheck("Eq15 Gaussian outside is frozen at begin, dL/df=-delta matches loss FD and extreme margins stay finite", pending.teacherSpec.emptyMean[0] === 2.5 && Object.isFrozen(pending.teacherSpec) && Object.isFrozen(pending.teacherSpec.emptyMean) && frozenTeacherMutation.threw && [evidence.lambda, evidence.logMixture, evidence.logEvidence, evidence.omega, evidence.delta, evidence.derivativeOfLossWrtMargin].every(relationFinite) && Math.abs(evidence.derivativeOfLossWrtMargin + evidence.delta) <= 1e-15 && evidence.omega >= 0 && evidence.omega <= 1 && teacherFd.every(row => row.relativeGap <= 2e-7) && extremeTeacher.every(row => [row.logMixture, row.logEvidence, row.loss, row.delta].every(relationFinite)) && [algebraicEvidence.logEmptyLikelihood, algebraicEvidence.loss].every(relationFinite), {teacherFixture, evidence, teacherFd, extremeMargins: extremeTeacher.map(row => ({pBefore: row.pBefore, logMixture: row.logMixture, logEvidence: row.logEvidence, delta: row.delta})), algebraicLogDensity: algebraicEvidence.logEmptyLikelihood, frozenTeacherMutation});
+  const equalQuery = {...query, id: "equal-query", x: [0.5, 0.25], recordVersion: "equal-query-v1"};
+  const equalCandidateA = {...candidateA, id: "equal-A", x: [0.25, 0.25], y: [0.5, 0.25], recordVersion: "equal-A-v1"};
+  const equalCandidateB = {...candidateB, id: "equal-B", x: [0.75, 0.25], y: [0.5, 0.25], recordVersion: "equal-B-v1"};
+  const equalArrival = {eventId: "E_equal", y: [0.5, 0.25], arrival: 4, action: "forward", teacherVersion: "teacher-fixture-v1"};
+  const equalSpec = {eventId: "E_equal", queryRecord: equalQuery, candidateA: equalCandidateA, candidateB: equalCandidateB, teacherSpec: {version: "teacher-fixture-v1", pi0: 0.1, variance: 1, emptyMean: [2.5, -2.5], emptyVariance: 1}};
+  const equalPending = relationCreatePending({...equalSpec, theta, thetaVersion: 0, options});
+  const equalEvidence = coverageTeacher(equalPending, equalArrival, teacherFixture);
+  recordCheck("Eq15 equal likelihood produces exactly zero teacher delta", Math.abs(equalEvidence.lambda) <= 1e-14 && Math.abs(equalEvidence.delta) <= 1e-14, {equalEvidence});
+  const outsideEvidence = coverageTeacher(pending, {eventId: "E_outside", y: [3, 3], arrival: 5}, {version: "teacher-outside-far-v1", pi0: 0.1, variance: 1, emptyMean: [3, 3], emptyVariance: 1});
+  const noCoverageEvidence = coverageTeacher(pending, {eventId: "E_outside_no_coverage", y: [3, 3], arrival: 5}, {version: "teacher-outside-rare-v1", pi0: 1e-8, variance: 1, emptyMean: [3, 3], emptyVariance: 1});
+  recordCheck("Eq15 candidate-set-outside Gaussian explanation suppresses rather than forces a large write", Math.abs(outsideEvidence.delta) < Math.abs(noCoverageEvidence.delta) && outsideEvidence.omega < noCoverageEvidence.omega, {outside: outsideEvidence, noCoverageReference: noCoverageEvidence});
+  const session = createOnlineState({theta, thetaVersion: 0, liveState: [0.21, -0.17, 0.08, -0.03, 0.04]});
+  const historyBefore = JSON.stringify({query, candidateA, candidateB}), liveBefore = [...session.liveState];
+  const onlinePending = beginRelationPending(session, pendingSpec);
+  const secondPending = tryError(() => beginRelationPending(session, {...pendingSpec, eventId: "E_second"}));
+  const mismatchArrival = tryError(() => consumeRelationPending(session, {eventId: "wrong", y: arrival.y, arrival: 3, action: "forward", teacherVersion: "teacher-fixture-v1"}, teacherFixture, 0.02));
+  const onlineUpdate = consumeRelationPending(session, arrival, teacherFixture, 0.02);
+  const duplicateArrival = tryError(() => consumeRelationPending(session, arrival, teacherFixture, 0.02));
+  const historyAfter = JSON.stringify({query, candidateA, candidateB});
+  recordCheck("Eq17 single pending, event identity, action and teacher version are enforced", secondPending.threw && mismatchArrival.threw && onlineUpdate.thetaVersionAfter === 1 && session.pending === null && session.consumedEventIds.length === 1, {secondPending, mismatchArrival, thetaBefore: onlineUpdate.thetaBefore, thetaAfter: onlineUpdate.thetaAfter, version: session.thetaVersion});
+  recordCheck("Eq17 duplicate arrival is rejected and history/live probes remain isolated", duplicateArrival.threw && historyBefore === historyAfter && relationGap(liveBefore, session.liveState) === 0 && relationFiniteVector(onlineUpdate.deltaTheta, 4), {duplicateArrival, historyUnchanged: historyBefore === historyAfter, liveUnchanged: relationGap(liveBefore, session.liveState) === 0, deltaTheta: onlineUpdate.deltaTheta});
+  const staleSession = createOnlineState({theta, thetaVersion: 0, liveState: liveBefore});
+  beginRelationPending(staleSession, {...pendingSpec, eventId: "E_stale"});
+  staleSession.thetaVersion = 1;
+  const staleVersion = tryError(() => consumeRelationPending(staleSession, {eventId: "E_stale", y: arrival.y, arrival: 3, action: "forward", teacherVersion: "teacher-fixture-v1"}, teacherFixture, 0.02));
+  const staleValueSession = createOnlineState({theta, thetaVersion: 0, liveState: liveBefore});
+  beginRelationPending(staleValueSession, {...pendingSpec, eventId: "E_stale_value"});
+  staleValueSession.theta[0] += 1e-6;
+  const staleValue = tryError(() => consumeRelationPending(staleValueSession, {eventId: "E_stale_value", y: arrival.y, arrival: 3, action: "forward", teacherVersion: "teacher-fixture-v1"}, teacherFixture, 0.02));
+  const equalSession = createOnlineState({theta, thetaVersion: 0, liveState: liveBefore});
+  beginRelationPending(equalSession, {...equalSpec, eventId: "E_equal_write"});
+  const equalUpdate = consumeRelationPending(equalSession, {...equalArrival, eventId: "E_equal_write"}, teacherFixture, 0.02);
+  const chronologySession = createOnlineState({theta, thetaVersion: 0, liveState: liveBefore});
+  beginRelationPending(chronologySession, {...pendingSpec, eventId: "E_chronology"});
+  const chronology = tryError(() => consumeRelationPending(chronologySession, {eventId: "E_chronology", y: arrival.y, arrival: 2, action: "forward", teacherVersion: "teacher-fixture-v1"}, teacherFixture, 0.02));
+  recordCheck("Eq17 theta version/value snapshots, candidate chronology and equal-likelihood zero write are enforced", staleVersion.threw && staleValue.threw && chronology.threw && equalUpdate.deltaTheta.every(value => value === 0) && relationGap(equalUpdate.thetaAfter, theta) === 0, {staleVersion, staleValue, chronology, equalUpdate: {evidence: equalUpdate.evidence, deltaTheta: equalUpdate.deltaTheta}});
+  const invalidDomain = {
+    nanTheta: tryError(() => freeToken(query, [Number.NaN, 0, 0, 0], options)),
+    overflowAlpha: tryError(() => freeToken(query, [1000, 0, 0, 0], options)),
+    negativeLeak: tryError(() => freeToken({...query, x: [1, 0]}, theta, {...options, epsilon: 2})),
+    negativeGamma: tryError(() => pairToken(query, candidateA, theta, {...options, gamma: -1})),
+    zeroTau: tryError(() => associationMargin(query, candidateA, candidateB, theta, {...options, tau: 0})),
+    nonconvergence: tryError(() => freeToken(query, theta, {...options, maxIterations: 0})),
+    conflictingTeacher: tryError(() => relationCreatePending({...pendingSpec, eventId: "E_conflicting_teacher", theta, thetaVersion: 0, options, teacherSpec: {...teacherFixture, logEmptyLikelihood: -3}})),
+    missingArrivalSequence: tryError(() => consumeRelationPending(createOnlineState({theta, thetaVersion: 0, liveState: liveBefore}), {eventId: "E_missing_sequence", y: arrival.y, action: "forward", teacherVersion: "teacher-fixture-v1"}, teacherFixture, 0.02)),
+    futureCandidate: tryError(() => relationCreatePending({...pendingSpec, eventId: "E_future_candidate", candidateA: {...candidateA, arrival: 3, recordVersion: "candidate-A-future-v1"}, theta, thetaVersion: 0, options})),
+  };
+  recordCheck("domain, positive-leakage, alpha, tau/gamma and nonconvergence failures are hard rejects", Object.values(invalidDomain).every(row => row.threw), invalidDomain);
+  const finiteEverything = [freeQuery.state, pair.state, margin.gradient, onlineUpdate.thetaAfter].flat().every(relationFinite);
+  recordCheck("all primary path states, energies, gradients and writes are finite with no silent clipping", finiteEverything, {finiteEverything});
+  const passed = checks.every(row => row.passed);
+  return {
+    scope: "Relation-energy T1 arithmetic only; no training, simulation, RGB/HM3D calibration, visual claim or novelty claim.",
+    entryPoint: "--relation-energy-check",
+    primary: true,
+    legacyGate: {status: "historical regression only", currentRecommended: false, oldResultJsonWritten: false, oldResultJsonPaths: ["idea-stage/SELECTIVE_CORRECTION_CHECK_20260909.json", "idea-stage/STRUCTURE_COMPUTATION_CHECK_20260909.json"]},
+    equations: {
+      Eq1: "I_j=k d_j+alpha_j d_j^3; alpha_j=k exp(theta_j)>0; no w",
+      Eq2: "Phi=1/2 sum L_j z_j^2+1/2 ell_s s^2+sum(k d_j^2/2+alpha_j d_j^4/4)",
+      Eq3: "U=(2h)^(-1)||Z-Zminus||^2+Phi-v^T Z",
+      Eq4: "free state is argmin U",
+      Eq8: "A_C=E*_C-nu_q-nu_C, where E*_C=min_{Z,W}{U_q(Z)+U_C(W)+gamma/2||S Z-S W||^2}",
+      Eq11: "e_C,j=B_j(Z_q|C)+B_j(Z_C|q)-B_j(Zbar_q)-B_j(Zbar_C), B_j=alpha_j d_j^4/4",
+      Eq13: "g=(e_B-e_A)/tau and f=(A_B-A_A)/tau",
+      Eq15: "M=pi P_A+(1-pi)P_B; Zev=(1-pi0)M+pi0 P_empty; dL/df=-delta in log-domain",
+      Eq17: "Delta theta=eta*delta*g after one pending/action/version/chronology-checked arrival",
+    },
+    api: {
+      freeToken: "freeToken(record, theta, options) -> {state, energy, alpha, stationarityResidual, ...}",
+      pairToken: "pairToken(query, candidate, theta, options) -> {queryState, candidateState, energy, couplingCost, ...}",
+      associationEnergy: "associationEnergy(query, candidate, theta, options) -> {value, e, localTerms, pair, ...}",
+      associationMargin: "associationMargin(query, candidateA, candidateB, theta, options) -> {value, gradient, eA, eB, ...}",
+      coverageTeacher: "coverageTeacher(pending, arrival, {version, pi0, variance, emptyMean, emptyVariance}) or finite logEmptyLikelihood for algebraic checks only -> {lambda, omega, delta, ...}",
+      online: "createOnlineState -> beginRelationPending(session, spec with frozen Gaussian teacher) -> consumeRelationPending(session, arrival, optional matching teacher, eta); one pending and duplicate/version/value/chronology checks are enforced",
+    },
+    parameters: {...options, theta, k: p.axial, leak: p.leak, somaLeak: p.somaLeak, compartmentCount: 4, stateDimensionPerRecord: 5, pairStateDimension: 10, pi0: "explicit teacher fixture only: 0.1"},
+    fixture: {query, candidateA, candidateB, histories, theta, evidenceArrival: arrival, equalArrival, teacherFixture, informationBoundary: {allowed: ["x", "actual action", "actual incoming", "completed candidate x/y records", "arrived y"], forbidden: ["pose", "depth", "overlap", "place identity", "reward", "success", "candidate truth"]}},
+    complexity: {pairedSolve: "dense Newton on a 10x10 paired Hessian", perNewtonLinearSolve: "O((2(H+1))^3) time and O((2(H+1))^2) memory", nonlinearIterations: "reported per solve", schur: {implemented: false, claim: "no O(H) Schur claim"}},
+    onlineSemantics: {kind: "conditional write transaction", continuousLiveDriverImplemented: false, callerMustCommitObservedFreeState: true, liveStateProbeWrites: false, chronology: "begin requires candidate arrivals <= query observedAt; consume requires query arrival > query observedAt and all completed candidates"},
+    primaryObservations: {associationA: {value: associationA.value, e: associationA.e, pair: {energy: associationA.pair.energy, couplingCost: associationA.pair.couplingCost, residual: associationA.pair.residual, iterations: associationA.pair.iterations}}, associationB: {value: associationB.value, e: associationB.e, pair: {energy: associationB.pair.energy, couplingCost: associationB.pair.couplingCost, residual: associationB.pair.residual, iterations: associationB.pair.iterations}}, margin: {value: margin.value, gradient: margin.gradient}, evidence, online: {thetaBefore: onlineUpdate.thetaBefore, thetaAfter: onlineUpdate.thetaAfter, deltaTheta: onlineUpdate.deltaTheta, thetaVersionAfter: onlineUpdate.thetaVersionAfter}},
+    checksPassed: checks.filter(row => row.passed).length,
+    checksTotal: checks.length,
+    checks,
+    passed,
+    verdict: passed ? "T1 relation-energy arithmetic and causal interface checks passed; this remains a conditional synthetic result." : "T1 failed; do not advance to T2 or visual claims.",
+  };
+}
+function relationSelectivityClock() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+function relationSelectivityRelationSolveSummary(margin) {
+  const queryFree = margin.queryFree, candidateAFree = margin.associationA.freeCandidate, candidateBFree = margin.associationB.freeCandidate, pairA = margin.associationA.pair, pairB = margin.associationB.pair;
+  return {freeSolves: 3, pairSolves: 2, linearResponseSolves: 0, totalSolverCalls: 5, newtonIterations: queryFree.iterations + candidateAFree.iterations + candidateBFree.iterations + pairA.iterations + pairB.iterations};
+}
+function relationSelectivityReadValue(method, context, theta, options) {
+  const started = relationSelectivityClock(), read = method === "relationEnergy"
+    ? relationEnergyMarginValueOnly(context.queryRecord, context.candidateA, context.candidateB, theta, options)
+    : relationDistanceMarginValueOnly(context.queryRecord, context.candidateA, context.candidateB, theta, options);
+  const elapsedMs = relationSelectivityClock() - started;
+  return {f: read.value, solveSummary: read.solveSummary, elapsedMs};
+}
+function relationSelectivityEvaluate(method, context, theta, options, y, teacherSpec) {
+  const started = relationSelectivityClock(), read = method === "relationEnergy"
+    ? relationAssociationMargin(context.queryRecord, context.candidateA, context.candidateB, theta, options)
+    : relationDistanceMargin(context.queryRecord, context.candidateA, context.candidateB, theta, options);
+  const predictions = context.predictions, teacherPending = {margin: read.value, muA: predictions.A.mu, muB: predictions.B.mu, queryRecord: {x: [...context.queryRecord.x]}}, teacher = relationCoverageTeacher(teacherPending, {y: [...y]}, teacherSpec), solveSummary = method === "relationEnergy" ? relationSelectivityRelationSolveSummary(read) : read.solveSummary, elapsedMs = relationSelectivityClock() - started;
+  assert.ok(relationFinite(read.value) && relationFiniteVector(read.gradient, relationCompartmentCount) && relationFinite(teacher.delta), "selectivity evaluation is nonfinite");
+  return {method, f: read.value, gradient: [...read.gradient], gradientNorm: relationEuclidean(read.gradient), delta: teacher.delta, sign: Math.sign(teacher.delta), teacher, solveSummary, elapsedMs};
+}
+function relationSelectivityMatchSelfCorrection({method, context, theta, options, y, teacherSpec, baseEvaluation, target}) {
+  const targetTolerance = Math.max(1e-10, 1e-6 * target), gradientNorm = relationEuclidean(baseEvaluation.gradient), directionNorm = Math.abs(baseEvaluation.delta) * gradientNorm, lambdaLimit = 1, started = relationSelectivityClock(), trace = [];
+  const common = {method, target, targetTolerance, lambdaLimit, directionNorm, trialUsesGradient: false, trialUsesTeacher: false, etaIsOfflineDiagnostic: true};
+  const solveCount = () => trace.reduce((sum, row) => sum + (row.solveSummary == null ? 0 : row.solveSummary.totalSolverCalls), 0), responseSolveCount = () => trace.reduce((sum, row) => sum + (row.solveSummary == null ? 0 : row.solveSummary.linearResponseSolves), 0);
+  const unmatched = (reason, lastTrial = null) => ({...common, matched: false, unmatchedReason: reason, eta: null, lambda: null, parameterStepL2: null, uMatched: null, matchError: null, solveCount: solveCount(), linearResponseSolves: responseSolveCount(), evaluations: trace.length, elapsedMs: relationSelectivityClock() - started, trace, lastTrial});
+  if (baseEvaluation.delta === 0) return unmatched("delta_zero");
+  if (gradientNorm === 0) return unmatched("gradient_zero");
+  if (!relationFinite(directionNorm) || directionNorm <= 0) return unmatched("nonfinite_or_zero_search_direction");
+  const evaluateLambda = lambda => {
+    const eta = lambda / directionNorm, thetaTrial = theta.map((value, j) => value + eta * baseEvaluation.delta * baseEvaluation.gradient[j]);
+    try {
+      const read = relationSelectivityReadValue(method, context, thetaTrial, options), u = Math.sign(baseEvaluation.delta) * (read.f - baseEvaluation.f);
+      if (!relationFinite(u) || !relationFinite(read.f)) return {ok: false, lambda, eta, theta: thetaTrial, error: "nonfinite self correction"};
+      return {ok: true, lambda, eta, theta: thetaTrial, f: read.f, u, solveSummary: read.solveSummary, elapsedMs: read.elapsedMs};
+    } catch (error) {
+      return {ok: false, lambda, eta, theta: thetaTrial, error: String(error.message || error)};
+    }
+  };
+  let lower = {ok: true, lambda: 0, eta: 0, theta: [...theta], f: baseEvaluation.f, u: 0, solveSummary: {totalSolverCalls: 0, linearResponseSolves: 0}, elapsedMs: 0}, upper = null, lambda = 1e-6;
+  for (;;) {
+    const trial = evaluateLambda(lambda), traceRow = {lambda: trial.lambda, eta: trial.eta, ok: trial.ok, f: trial.ok ? trial.f : null, u: trial.ok ? trial.u : null, solveSummary: trial.solveSummary || null, error: trial.error || null};
+    trace.push(traceRow);
+    if (!trial.ok) return unmatched("nonfinite_or_domain_during_search", trial);
+    if (trial.u >= target) {
+      upper = trial;
+      break;
+    }
+    lower = trial;
+    if (lambda >= lambdaLimit) return unmatched("search_budget_not_bracketed", trial);
+    lambda = Math.min(lambdaLimit, lambda * 2);
+  }
+  let best = Math.abs(lower.u - target) <= Math.abs(upper.u - target) ? lower : upper;
+  for (let iteration = 0; iteration < 80; iteration++) {
+    if (Math.abs(best.u - target) <= targetTolerance) break;
+    const midpoint = (lower.lambda + upper.lambda) / 2, trial = evaluateLambda(midpoint), traceRow = {lambda: trial.lambda, eta: trial.eta, ok: trial.ok, f: trial.ok ? trial.f : null, u: trial.ok ? trial.u : null, solveSummary: trial.solveSummary || null, error: trial.error || null};
+    trace.push(traceRow);
+    if (!trial.ok) return unmatched("nonfinite_or_domain_during_search", trial);
+    if (Math.abs(trial.u - target) < Math.abs(best.u - target)) best = trial;
+    if (trial.u >= target) upper = trial;
+    else lower = trial;
+  }
+  const matchError = Math.abs(best.u - target), matched = matchError <= targetTolerance;
+  return {...common, matched, unmatchedReason: matched ? null : "search_bracketed_but_bisection_tolerance_unmet", eta: matched ? best.eta : null, lambda: matched ? best.lambda : null, parameterStepL2: matched ? relationEuclidean(relationSub(best.theta, theta)) : null, uMatched: matched ? best.u : null, matchError: matched ? matchError : null, solveCount: solveCount(), linearResponseSolves: responseSolveCount(), evaluations: trace.length, elapsedMs: relationSelectivityClock() - started, thetaAfter: matched ? [...best.theta] : [...theta], fAfter: matched ? best.f : null, trace};
+}
+function relationSelectivityGram(gradients) {
+  assert.ok(Array.isArray(gradients) && gradients.length === 2 && gradients.every(row => relationFiniteVector(row, relationCompartmentCount)), "selectivity Gram requires two finite length-4 gradients");
+  const normG0 = relationEuclidean(gradients[0]), normG1 = relationEuclidean(gradients[1]), K = [[relationDot(gradients[0], gradients[0]), relationDot(gradients[0], gradients[1])], [relationDot(gradients[1], gradients[0]), relationDot(gradients[1], gradients[1])]], c = normG0 > 0 && normG1 > 0 ? K[0][1] / (normG0 * normG1) : null, absK01OverKii = {K00: Math.abs(K[0][1]) / Math.max(K[0][0], Number.MIN_VALUE), K11: Math.abs(K[0][1]) / Math.max(K[1][1], Number.MIN_VALUE)}, normalizedGramMinEigenvalue = c === null ? null : 1 - Math.abs(c), normalizedGramMaxEigenvalue = c === null ? null : 1 + Math.abs(c), Rmax = c === null ? null : Math.abs(c) * Math.max(normG0 / Math.max(normG1, Number.MIN_VALUE), normG1 / Math.max(normG0, Number.MIN_VALUE));
+  return {G: gradients.map(row => [...row]), normG: [normG0, normG1], K, c, absK01OverKii, normalizedGramEigenvalues: c === null ? null : [normalizedGramMinEigenvalue, normalizedGramMaxEigenvalue], normalizedGramMinEigenvalue, Rmax, normalizedGramNote: "1-|c| is the normalized Gram minimum eigenvalue, not independent evidence"};
+}
+function relationSelectivityHistorySnapshot(id, prefix, theta, options) {
+  let incoming = relationZero();
+  const steps = [];
+  for (let index = 0; index < prefix.length; index++) {
+    const x = [...prefix[index]], record = {id: `${id}_${index}`, x, incoming: [...incoming], recordVersion: `${id}-theta-nonzero-v1`}, free = relationFreeToken(record, theta, options);
+    steps.push({x, incoming: [...incoming], state: [...free.state], residual: free.residual, gradientResidual: free.gradientResidual});
+    incoming = [...free.state];
+  }
+  return {id, prefix: prefix.map(x => [...x]), incoming: [...incoming], steps};
+}
+function relationSelectivityContext(basePointId, historyId, historySnapshots, candidateIncoming) {
+  const queryRecord = {id: `query_${basePointId}_${historyId}`, x: [0.8, 0.2], action: "forward", arrival: null, completed: false, observedAt: 2, recordVersion: `query-${basePointId}-${historyId}-v1`, incoming: [...historySnapshots[historyId].incoming]};
+  const candidateA = {id: "A", x: [0.3, 0.7], y: [0.4, 0.7], action: "forward", arrival: 1, completed: true, recordVersion: `candidate-A-${basePointId}-v1`, incoming: [...candidateIncoming.A]};
+  const candidateB = {id: "B", x: [0.7, -0.2], y: [0.6, -0.2], action: "forward", arrival: 2, completed: true, recordVersion: `candidate-B-${basePointId}-v1`, incoming: [...candidateIncoming.B]};
+  const predictionA = relationTransition(candidateA, queryRecord), predictionB = relationTransition(candidateB, queryRecord);
+  return {basePointId, historyId, queryRecord, candidateA, candidateB, predictions: {A: predictionA, B: predictionB}};
+}
+function relationSelectivityProbabilitySummary(before, after) {
+  return {priorBefore: before.teacher.pBefore, priorAfter: after.teacher.pBefore, priorChange: after.teacher.pBefore - before.teacher.pBefore, posteriorBefore: before.teacher.pPlus, posteriorAfter: after.teacher.pPlus, posteriorChange: after.teacher.pPlus - before.teacher.pPlus, logitBefore: before.f, logitAfter: after.f};
+}
+function relationSelectivityRunSequence({cellId, method, target, contexts, yByHistory, order, thetaInitial, options, teacherSpec}) {
+  let theta = [...thetaInitial], evaluationCount = 0, totalSolverCalls = 0, totalLinearResponseSolves = 0, totalElapsedMs = 0;
+  const evaluate = (historyId, thetaValue) => {
+    const result = relationSelectivityEvaluate(method, contexts[historyId], thetaValue, options, yByHistory[historyId], teacherSpec);
+    evaluationCount += 1;
+    totalSolverCalls += result.solveSummary.totalSolverCalls;
+    totalLinearResponseSolves += result.solveSummary.linearResponseSolves;
+    totalElapsedMs += result.elapsedMs;
+    return result;
+  };
+  const evaluateBoth = thetaValue => ({H0: evaluate("H0", thetaValue), H1: evaluate("H1", thetaValue)}), before = evaluateBoth(theta), writes = [], afterStates = [];
+  let current = before;
+  for (let stepIndex = 0; stepIndex < order.length; stepIndex++) {
+    const historyId = order[stepIndex], startEvaluation = current[historyId], thetaBefore = [...theta], match = relationSelectivityMatchSelfCorrection({method, context: contexts[historyId], theta: thetaBefore, options, y: yByHistory[historyId], teacherSpec, baseEvaluation: startEvaluation, target}), applied = match.matched;
+    const thetaAfter = applied ? [...match.thetaAfter] : [...thetaBefore], deltaTheta = applied ? relationSub(thetaAfter, thetaBefore) : [0, 0, 0, 0];
+    if (applied) {
+      const expectedDeltaTheta = startEvaluation.gradient.map(value => match.eta * startEvaluation.delta * value);
+      assert.ok(relationGap(deltaTheta, expectedDeltaTheta) <= 2e-12, "matched selectivity write does not follow theta+eta*delta*g");
+      relationAssertTheta(thetaAfter);
+      relationCoefficients(thetaAfter);
+    }
+    theta = thetaAfter;
+    current = evaluateBoth(theta);
+    afterStates.push(current);
+    const ownAfter = current[historyId], ownChange = Math.sign(startEvaluation.delta) === 0 ? null : Math.sign(startEvaluation.delta) * (ownAfter.f - startEvaluation.f);
+    writes.push({step: stepIndex + 1, historyId, y: [...yByHistory[historyId]], thetaBefore, fBefore: startEvaluation.f, gradientBefore: [...startEvaluation.gradient], gradientNormBefore: startEvaluation.gradientNorm, delta: startEvaluation.delta, signFromActualDelta: Math.sign(startEvaluation.delta), teacherBefore: {lambda: startEvaluation.teacher.lambda, pBefore: startEvaluation.teacher.pBefore, pPlus: startEvaluation.teacher.pPlus, logit: startEvaluation.f}, match, applied, deltaTheta, parameterStepL2: relationEuclidean(deltaTheta), thetaAfter: [...thetaAfter], fSelfAfter: ownAfter.f, signedOwnCorrection: applied ? ownChange : null, teacherAfter: {lambda: ownAfter.teacher.lambda, pBefore: ownAfter.teacher.pBefore, pPlus: ownAfter.teacher.pPlus, logit: ownAfter.f}, probability: relationSelectivityProbabilitySummary(startEvaluation, ownAfter)});
+  }
+  const after1 = afterStates[0], after2 = afterStates[1], firstHistory = order[0], secondHistory = order[1], firstWrite = writes[0], secondWrite = writes[1], U0 = firstWrite.applied ? Math.sign(firstWrite.delta) * (after1[firstHistory].f - before[firstHistory].f) : null, U1 = secondWrite.applied ? Math.sign(secondWrite.delta) * (after2[secondHistory].f - after1[secondHistory].f) : null;
+  // crossFirst is the first write's effect on the other association.  It is
+  // reported separately.  The retained-first interference metric is the
+  // second write's effect on the first association (crossSecond), signed by
+  // the first write's actual teacher delta.
+  const crossFirst = after1[secondHistory].f - before[secondHistory].f, signedCrossFirstByOtherDelta = Math.sign(secondWrite.delta) === 0 ? null : Math.sign(secondWrite.delta) * crossFirst, crossSecond = after2[firstHistory].f - after1[firstHistory].f, signedCrossSecondByFirstDelta = Math.sign(firstWrite.delta) === 0 ? null : Math.sign(firstWrite.delta) * crossSecond, H0 = U0 === null || signedCrossSecondByFirstDelta === null ? null : Math.max(0, -signedCrossSecondByFirstDelta), D0 = U0 === null || signedCrossSecondByFirstDelta === null ? null : U0 + signedCrossSecondByFirstDelta, HOverU0 = H0 === null || U0 <= 0 ? null : H0 / U0, DOverU0 = D0 === null || U0 <= 0 ? null : D0 / U0, absCrossOverU1 = U1 === null || U1 <= 0 ? null : Math.abs(crossSecond) / U1;
+  const secondStepStartGram = relationSelectivityGram([after1.H0.gradient, after1.H1.gradient]);
+  const scienceGate = {matchedBoth: firstWrite.applied && secondWrite.applied, U0, U1, crossFirst, signedCrossFirstByOtherDelta, crossSecond, signedCrossSecondByFirstDelta, H0, D0, HOverU0, DOverU0, absCrossOverU1, HOverUPassed: HOverU0 !== null && HOverU0 <= 0.25, DOverUPassed: DOverU0 !== null && DOverU0 >= 0.5, passed: firstWrite.applied && secondWrite.applied && HOverU0 !== null && HOverU0 <= 0.25 && DOverU0 !== null && DOverU0 >= 0.5};
+  const result = {cellId, method, target, order: [...order], fTrajectory: {H0: {fBefore: before.H0.f, fAfter1: after1.H0.f, fAfter2: after2.H0.f}, H1: {fBefore: before.H1.f, fAfter1: after1.H1.f, fAfter2: after2.H1.f}}, initialTeacherDelta: {H0: before.H0.delta, H1: before.H1.delta}, writes, U0, U1, crossEffects: {firstWriteOnOther: {raw: crossFirst, signedByOtherDelta: signedCrossFirstByOtherDelta, interpretation: "reported separately; this is not the retained-first interference metric"}, retainedFirstAfterSecondWrite: {raw: crossSecond, signedByFirstDelta: signedCrossSecondByFirstDelta, H: H0, D: D0, HOverU: HOverU0, DOverU: DOverU0, absCrossOverUSecond: absCrossOverU1, interpretation: "second write's effect on the first association, signed by the first write's actual delta"}, secondWriteOnFirst: {raw: crossSecond, signedByFirstDelta: signedCrossSecondByFirstDelta, H: H0, D: D0}}, secondStepStart: {theta: [...writes[0].thetaAfter], f: {H0: after1.H0.f, H1: after1.H1.f}, gradients: {H0: [...after1.H0.gradient], H1: [...after1.H1.gradient]}, gram: secondStepStartGram, note: "actual post-first-write gradients/Gram; not the initial Gram finite-step prediction"}, solverCost: {fullEvaluationCount: evaluationCount, fullEvaluationSolverCalls: totalSolverCalls, fullEvaluationLinearResponseSolves: totalLinearResponseSolves, fullEvaluationElapsedMs: totalElapsedMs, matchingSolverCalls: writes.reduce((sum, write) => sum + write.match.solveCount, 0), matchingLinearResponseSolves: writes.reduce((sum, write) => sum + write.match.linearResponseSolves, 0), matchingEvaluations: writes.reduce((sum, write) => sum + write.match.evaluations, 0), matchingElapsedMs: writes.reduce((sum, write) => sum + write.match.elapsedMs, 0)}, scienceGate};
+  result.trajectoryAudit = relationSelectivityTrajectoryAudit(result);
+  return result;
+}
+function relationSelectivityRecomputeTrajectoryMetrics(sequence) {
+  const firstHistory = sequence.order[0], secondHistory = sequence.order[1], firstWrite = sequence.writes[0], secondWrite = sequence.writes[1], firstTrajectory = sequence.fTrajectory[firstHistory], secondTrajectory = sequence.fTrajectory[secondHistory], signFirst = Math.sign(firstWrite.delta), signSecond = Math.sign(secondWrite.delta), U0 = firstWrite.applied ? signFirst * (firstTrajectory.fAfter1 - firstTrajectory.fBefore) : null, U1 = secondWrite.applied ? signSecond * (secondTrajectory.fAfter2 - secondTrajectory.fAfter1) : null, crossFirst = secondTrajectory.fAfter1 - secondTrajectory.fBefore, crossSecond = firstTrajectory.fAfter2 - firstTrajectory.fAfter1, signedCrossFirstByOtherDelta = signSecond === 0 ? null : signSecond * crossFirst, signedCrossSecondByFirstDelta = signFirst === 0 ? null : signFirst * crossSecond, H0 = U0 === null || signedCrossSecondByFirstDelta === null ? null : Math.max(0, -signedCrossSecondByFirstDelta), D0 = U0 === null || signedCrossSecondByFirstDelta === null ? null : U0 + signedCrossSecondByFirstDelta, HOverU0 = H0 === null || U0 <= 0 ? null : H0 / U0, DOverU0 = D0 === null || U0 <= 0 ? null : D0 / U0, absCrossOverU1 = U1 === null || U1 <= 0 ? null : Math.abs(crossSecond) / U1;
+  return {firstHistory, secondHistory, signFirst, signSecond, U0, U1, crossFirst, signedCrossFirstByOtherDelta, crossSecond, signedCrossSecondByFirstDelta, H0, D0, HOverU0, DOverU0, absCrossOverU1};
+}
+function relationSelectivityScalarClose(left, right, tolerance = 2e-12) {
+  if (left === null || right === null) return left === right;
+  return relationFinite(left) && relationFinite(right) && Math.abs(left - right) <= tolerance * Math.max(1, Math.abs(left), Math.abs(right));
+}
+function relationSelectivityTrajectoryAudit(sequence) {
+  const expected = relationSelectivityRecomputeTrajectoryMetrics(sequence), actual = sequence.scienceGate, fields = ["U0", "U1", "crossFirst", "signedCrossFirstByOtherDelta", "crossSecond", "signedCrossSecondByFirstDelta", "H0", "D0", "HOverU0", "DOverU0", "absCrossOverU1"], passed = fields.every(field => relationSelectivityScalarClose(expected[field], actual[field])) && relationSelectivityScalarClose(sequence.crossEffects.firstWriteOnOther.raw, expected.crossFirst) && relationSelectivityScalarClose(sequence.crossEffects.retainedFirstAfterSecondWrite.raw, expected.crossSecond) && relationSelectivityScalarClose(sequence.crossEffects.retainedFirstAfterSecondWrite.H, expected.H0) && relationSelectivityScalarClose(sequence.crossEffects.retainedFirstAfterSecondWrite.D, expected.D0);
+  return {passed, fields, expected, actual: Object.fromEntries(fields.map(field => [field, actual[field]])), note: "independently recomputed from stored fBefore/fAfter1/fAfter2 and actual first/second teacher signs; crossFirst is not used for retained-first H/D"};
+}
+function relationSelectivitySyntheticTrajectoryUnitCheck() {
+  const sequence = {order: ["H0", "H1"], fTrajectory: {H0: {fBefore: 0, fAfter1: 1, fAfter2: 0.8}, H1: {fBefore: 0, fAfter1: -0.3, fAfter2: -0.5}}, writes: [{delta: 1, applied: true}, {delta: -1, applied: true}]}, metrics = relationSelectivityRecomputeTrajectoryMetrics(sequence), expected = {U0: 1, U1: 0.2, crossFirst: -0.3, crossSecond: -0.2, signedCrossSecondByFirstDelta: -0.2, H0: 0.2, D0: 0.8, HOverU0: 0.2, DOverU0: 0.8, absCrossOverU1: 1};
+  return {passed: Object.keys(expected).every(field => relationSelectivityScalarClose(metrics[field], expected[field])), sequence, metrics, expected, note: "opposite first/second delta signs and distinct fBefore/fAfter1/fAfter2 distinguish crossFirst from retained-first crossSecond"};
+}
+function relationSelectivityGradientCheck(method, context, theta, options, y, teacherSpec) {
+  const analytic = relationSelectivityEvaluate(method, context, theta, options, y, teacherSpec), steps = [1e-3, 1e-4, 1e-5], finiteDifference = steps.map(step => {
+    const gradient = theta.map((_, parameter) => {
+      const plusTheta = theta.map((value, index) => value + (index === parameter ? step : 0)), minusTheta = theta.map((value, index) => value - (index === parameter ? step : 0));
+      return (relationSelectivityReadValue(method, context, plusTheta, options).f - relationSelectivityReadValue(method, context, minusTheta, options).f) / (2 * step);
+    });
+    const absoluteError = relationMaxAbs(gradient.map((value, index) => value - analytic.gradient[index])), relativeError = absoluteError / Math.max(analytic.gradientNorm, Number.MIN_VALUE);
+    return {step, finiteDifference: gradient, absoluteError, relativeError, passed: relativeError <= 5e-6};
+  });
+  return {method, analyticGradient: analytic.gradient, analyticGradientNorm: analytic.gradientNorm, minimumRequiredNorm: 1e-6, finiteDifference, passed: analytic.gradientNorm > 1e-6 && finiteDifference.every(row => row.passed)};
+}
+function relationSelectivityFiniteNumbers(value) {
+  if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(relationSelectivityFiniteNumbers);
+  if (typeof value === "object") return Object.values(value).every(relationSelectivityFiniteNumbers);
+  return true;
+}
+function runRelationEnergySelectivityCheck() {
+  const thetaInitial = [0.18, -0.11, 0.07, -0.05], options = {h: 0.4, epsilon: 0, gamma: 1, tau: 1, tolerance: 1e-12, maxIterations: 80}, prefixes = {H0: [[1, 0], [0, 1]], H1: [[0, 1], [1, 0]]}, historySnapshots = {H0: relationSelectivityHistorySnapshot("H0", prefixes.H0, thetaInitial, options), H1: relationSelectivityHistorySnapshot("H1", prefixes.H1, thetaInitial, options)}, candidateIncoming = {cold: {A: relationZero(), B: relationZero()}, warm: {A: [...historySnapshots.H0.incoming], B: [...historySnapshots.H1.incoming]}, warmSwapped: {A: [...historySnapshots.H1.incoming], B: [...historySnapshots.H0.incoming]}}, basePointIds = ["cold", "warm", "warmSwapped"], historyIds = ["H0", "H1"], contexts = {}, teacherSpec = relationFreezeTeacherSpec({version: "selectivity-gaussian-empty-v1", pi0: 0.1, variance: 1, emptyMean: [2.5, -2.5], emptyVariance: 1}, true), yPlus = [0.9, 0.23], yMinus = [0.7, 0.23], evidenceDirections = [{id: "plus_plus", yByHistory: {H0: [...yPlus], H1: [...yPlus]}}, {id: "plus_minus", yByHistory: {H0: [...yPlus], H1: [...yMinus]}}, {id: "minus_plus", yByHistory: {H0: [...yMinus], H1: [...yPlus]}}, {id: "minus_minus", yByHistory: {H0: [...yMinus], H1: [...yMinus]}}], orders = [{id: "H0_then_H1", historyIds: ["H0", "H1"]}, {id: "H1_then_H0", historyIds: ["H1", "H0"]}], targets = [{id: "U_1e-4", value: 1e-4, role: "pressure_low"}, {id: "U_1e-3", value: 1e-3, role: "primary"}, {id: "U_1e-2", value: 1e-2, role: "pressure_high"}];
+  for (const basePointId of basePointIds) {
+    contexts[basePointId] = {};
+    for (const historyId of historyIds) contexts[basePointId][historyId] = relationSelectivityContext(basePointId, historyId, historySnapshots, candidateIncoming[basePointId]);
+  }
+  const baseSensitivity = {}, gradientChecks = {};
+  for (const basePointId of basePointIds) {
+    baseSensitivity[basePointId] = {};
+    for (const method of ["relationEnergy", "distance"]) {
+      const evaluations = historyIds.map(historyId => relationSelectivityEvaluate(method, contexts[basePointId][historyId], thetaInitial, options, yPlus, teacherSpec));
+      baseSensitivity[basePointId][method] = {...relationSelectivityGram(evaluations.map(evaluation => evaluation.gradient)), delta: evaluations.map(evaluation => evaluation.delta), f: evaluations.map(evaluation => evaluation.f), gradientNormMinimum: Math.min(...evaluations.map(evaluation => evaluation.gradientNorm))};
+    }
+  }
+  gradientChecks.relationEnergy = relationSelectivityGradientCheck("relationEnergy", contexts.warm.H0, thetaInitial, options, yPlus, teacherSpec);
+  gradientChecks.distance = relationSelectivityGradientCheck("distance", contexts.warm.H0, thetaInitial, options, yPlus, teacherSpec);
+  const syntheticTrajectoryUnitTest = relationSelectivitySyntheticTrajectoryUnitCheck();
+  const cells = [];
+  for (const basePointId of basePointIds) for (const direction of evidenceDirections) for (const order of orders) {
+    const cellId = basePointId + "__" + direction.id + "__" + order.id, methods = {};
+    for (const method of ["relationEnergy", "distance"]) {
+      methods[method] = {};
+      for (const target of targets) methods[method][target.id] = relationSelectivityRunSequence({cellId, method, target: target.value, contexts: contexts[basePointId], yByHistory: direction.yByHistory, order: order.historyIds, thetaInitial, options, teacherSpec});
+    }
+    cells.push({cellId, basePoint: basePointId, evidenceDirection: direction.id, order: order.id, methods});
+  }
+  const allSequences = cells.flatMap(cell => Object.values(cell.methods).flatMap(methodResults => Object.values(methodResults))), trajectoryChecks = allSequences.map(sequence => ({cellId: sequence.cellId, method: sequence.method, target: sequence.target, ...relationSelectivityTrajectoryAudit(sequence)})), trajectoryChecksPassed = trajectoryChecks.every(check => check.passed), matchedWriteChecksPassed = allSequences.every(sequence => sequence.writes.every(write => !write.applied || (write.match.matched && write.match.lambda <= 1 + 1e-12 && write.match.parameterStepL2 <= 1 + 1e-12 && write.match.matchError <= write.match.targetTolerance))), completeCellsPassed = cells.length === 24 && cells.every(cell => Object.keys(cell.methods).length === 2 && ["relationEnergy", "distance"].every(method => Object.keys(cell.methods[method]).length === targets.length)), baseSensitivityPassed = Object.values(baseSensitivity).every(methods => Object.values(methods).every(summary => summary.gradientNormMinimum > 1e-6));
+  const pairedComparisons = cells.flatMap(cell => targets.map(target => {
+    const relationEnergy = cell.methods.relationEnergy[target.id], distance = cell.methods.distance[target.id], bothMatched = relationEnergy.scienceGate.matchedBoth && distance.scienceGate.matchedBoth;
+    return {cellId: cell.cellId, basePoint: cell.basePoint, evidenceDirection: cell.evidenceDirection, order: cell.order, target: target.value, targetId: target.id, bothMatched, relationEnergy: {matched: relationEnergy.scienceGate.matchedBoth, HOverU: relationEnergy.scienceGate.HOverU0, DOverU: relationEnergy.scienceGate.DOverU0, absCrossOverUSecond: relationEnergy.scienceGate.absCrossOverU1}, distance: {matched: distance.scienceGate.matchedBoth, HOverU: distance.scienceGate.HOverU0, DOverU: distance.scienceGate.DOverU0, absCrossOverUSecond: distance.scienceGate.absCrossOverU1}, comparison: bothMatched ? {deltaAbsCrossOverUSecond: relationEnergy.scienceGate.absCrossOverU1 - distance.scienceGate.absCrossOverU1, noWinnerSelected: true} : {status: "not-compared-unmatched", noWinnerSelected: true}};
+  }));
+  const summary = {cellCount: cells.length, expectedCellCount: 24, methods: {}, pairedComparisonCount: pairedComparisons.length, pairedMatchedCount: pairedComparisons.filter(comparison => comparison.bothMatched).length, primaryTarget: "U_1e-3", targetRoles: Object.fromEntries(targets.map(target => [target.id, target.role]))};
+  for (const method of ["relationEnergy", "distance"]) {
+    summary.methods[method] = {};
+    for (const target of targets) {
+      const sequences = cells.map(cell => cell.methods[method][target.id]);
+      summary.methods[method][target.id] = {total: sequences.length, firstMatched: sequences.filter(sequence => sequence.writes[0].applied).length, secondMatched: sequences.filter(sequence => sequence.writes[1].applied).length, bothMatched: sequences.filter(sequence => sequence.scienceGate.matchedBoth).length, thresholdPassed: sequences.filter(sequence => sequence.scienceGate.passed).length, unmatchedReasons: sequences.flatMap(sequence => sequence.writes.filter(write => !write.applied).map(write => write.match.unmatchedReason)).reduce((counts, reason) => ({...counts, [reason]: (counts[reason] || 0) + 1}), {})};
+    }
+  }
+  const primaryTargetId = "U_1e-3", primaryRelationEnergySequences = cells.map(cell => cell.methods.relationEnergy[primaryTargetId]), scientificGatePassed = primaryRelationEnergySequences.every(sequence => sequence.scienceGate.matchedBoth && sequence.scienceGate.passed && sequence.scienceGate.absCrossOverU1 !== null && sequence.scienceGate.absCrossOverU1 <= 0.25), panelAllMethodsPrimaryThresholdsPassed = cells.every(cell => ["relationEnergy", "distance"].every(method => cell.methods[method][primaryTargetId].scienceGate.passed)), correctnessChecks = {gradientRelationEnergy: gradientChecks.relationEnergy.passed, gradientDistance: gradientChecks.distance.passed, nonzeroGradientNorms: baseSensitivityPassed, trajectoryMetricRecomputation: trajectoryChecksPassed, syntheticTrajectoryUnitTest: syntheticTrajectoryUnitTest.passed, matchedWriteBudgetAndTolerance: matchedWriteChecksPassed, complete24Cells: completeCellsPassed, allReportedNumbersFinite: relationSelectivityFiniteNumbers({baseSensitivity, gradientChecks, syntheticTrajectoryUnitTest, cells, pairedComparisons})}, correctnessPassed = Object.values(correctnessChecks).every(value => value === true);
+  const fixture = {thetaInitial: [...thetaInitial], options, prefixes, historySnapshots, candidateIncoming, records: {query: {x: [0.8, 0.2], action: "forward", observedAt: 2, completed: false}, candidateA: {x: [0.3, 0.7], y: [0.4, 0.7], action: "forward", arrival: 1, completed: true}, candidateB: {x: [0.7, -0.2], y: [0.6, -0.2], action: "forward", arrival: 2, completed: true}}, evidenceDirections, orders, teacherSpec, candidateContextRule: "cold=(0,0) incoming; warm=(H0,H1); warmSwapped=(H1,H0)", learnerInputs: "only numeric y is passed to each evaluation; direction/order labels remain report metadata"};
+  return {scope: "offline cross-association selectivity diagnostic after matching each method's own correction; not an online learning-rate result and not an automatic superiority proof", entryPoint: "--relation-energy-selectivity-check", diagnosticOnly: true, correctnessPassed, correctnessChecks, scientificGatePassed, panelAllMethodsPrimaryThresholdsPassed, equations: {relationEnergy: "existing associationMargin/e with full four-port paired energy", distance: "A_D(q,C)=gamma/2||S Z_q-S Z_C||^2; f_D=(A_D_B-A_D_A)/tau", update: "theta'=theta+eta*delta*g; lambda=eta*|delta|*||g|| is search coordinate only", interference: "retained-first cross= f_first(after2)-f_first(after1), signed by sign(first delta); first-write-on-other cross is separately reported"}, configuration: {theta: [...thetaInitial], h: options.h, epsilon: options.epsilon, gamma: options.gamma, tau: options.tau, targetTolerance: "max(1e-10,1e-6*U)", lambdaLimit: 1, absoluteCriterion: "|C|/U_second <= 0.25 for the primary E diagnostic gate", search: "nonnegative doubling then bisection; unmatched means no bracket within this budget, not global impossibility", teacherFreeze: "one cloned Gaussian outside model for all cells; no mutable callback; online teacher version is fixed", supplementalEpsilon005: {epsilon: 0.05, executed: false, reason: "main frozen diagnostic uses epsilon=0; no result selection by supplement"}}, fixture, gradientChecks, syntheticTrajectoryUnitTest, baseSensitivity, trajectoryAudit: {total: trajectoryChecks.length, passed: trajectoryChecks.filter(check => check.passed).length, failed: trajectoryChecks.filter(check => !check.passed)}, targets, summary, pairedComparisons, cells, interpretation: {scientificGate: "scientificGatePassed is only the current primary relation-energy E criterion: all primary E cells must be matched, pass H/U and D/U thresholds, and satisfy the absolute cross criterion; it is not a baseline or superiority gate", panelGate: "panelAllMethodsPrimaryThresholdsPassed reports the old all-method primary threshold panel separately and is not used to define scientificGatePassed", scientificThresholds: "per sequence H/U<=0.25 and D/U>=0.50 are retained in scienceGate; absCross/U_second is also reported", matching: "each lambda trial freezes the starting theta, actual delta and gradient and recomputes f only; next write recomputes gradients and teacher", probability: "probability changes and original f logits are retained to show the common energy-unit limitation", noAutomaticClaim: true}, limitations: {etaIsOfflineDiagnostic: true, continuousTrajectoryNotClaimed: true, noTrainingSimulationOrCalibration: true, densePairedSolve: "relation-energy uses the existing dense 10x10 Newton solve; distance uses free solves plus sharedResponse analytic chain; no O(H) Schur claim"}};
+}
+if (require.main === module) {
+  if (relationEnergyOnly) {
+    const relationEnergyQualification = runRelationEnergyCheck();
+    const relationRendered = JSON.stringify(relationEnergyQualification, null, 2) + "\n";
+    fs.writeFileSync("idea-stage/RELATION_ENERGY_CHECK_20260909.json", relationRendered, "utf8");
+    if (!relationEnergyQualification.passed) process.exitCode = 1;
+    process.stdout.write(relationRendered);
+  } else if (relationEnergySelectivityOnly) {
+    const selectivityQualification = runRelationEnergySelectivityCheck(), selectivityRendered = JSON.stringify(selectivityQualification, null, 2) + "\n";
+    fs.writeFileSync("idea-stage/RELATION_ENERGY_SELECTIVITY_20260909.json", selectivityRendered, "utf8");
+    if (!selectivityQualification.correctnessPassed) process.exitCode = 1;
+    process.stdout.write(JSON.stringify({entryPoint: selectivityQualification.entryPoint, correctnessPassed: selectivityQualification.correctnessPassed, scientificGatePassed: selectivityQualification.scientificGatePassed, summary: selectivityQualification.summary, resultPath: "idea-stage/RELATION_ENERGY_SELECTIVITY_20260909.json"}, null, 2) + "\n");
+  } else {
 function voltage(segments, epsilon, step = 0.002, mismatch = 0, initial = [0, 0, 0, 0, 0]) {
   const bound = Math.max(...segments.flatMap(s => [Math.abs(s.a), Math.abs(s.b)]));
   // leak = fixed leak/2 + tonic shunt/2; even the modulated shunt stays positive.
@@ -828,70 +1808,10 @@ if (constructiveCouplingOnly) {
   const connectionSigns = [1, -1, -1, 1];
   const read = state => pairHistory(state);
   const lift = b => [b[0] / 2, -b[0] / 2, -b[1] / 2, b[1] / 2, 0];
-  function incomingWeightData(incoming, Cstar, mode = "full") {
-    assert.ok(mode === "full" || mode === "difference" || mode === "common", "unknown selective weight mode");
-    assert.ok(Number.isFinite(Cstar) && Cstar > 0, "selective contrast scale must be positive");
-    const q = incoming.slice(0, 4).map(value => (value - incoming[4]) ** 2), P = q.reduce((sum, value) => sum + value, 0) / 4;
-    const e = q.map(value => (value - P) / Cstar);
-    const weights = mode === "full"
-      ? e.map((value, j) => 1 + connectionSigns[j] * value)
-      : mode === "difference"
-        ? e.map((value, j) => connectionSigns[j] * value)
-        : e.map(() => 1);
-    return {q, P, Cstar, e, weights, mode, connectionSigns: [...connectionSigns]};
-  }
-  // Arrowhead linear response: one scalar soma solve and four branch solves.
-  function response(diagonal, edge, rhs) {
-    const denominator = diagonal[4] - edge.reduce((sum, g, j) => sum + g * g / diagonal[j], 0);
-    assert.ok(denominator > 0 && diagonal.every(d => d > 0), "response must be positive definite");
-    const soma = (rhs[4] + edge.reduce((sum, g, j) => sum + g * rhs[j] / diagonal[j], 0)) / denominator;
-    return [...edge.map((g, j) => (rhs[j] + g * soma) / diagonal[j]), soma];
-  }
-  function event(th, input, carrier = "axial", incoming = cold, tolerance = 1e-12, eps = epsilon, audit = null, weightContext = null) {
-    assert.ok(carrier === "axial" || carrier === "tonic", "unknown plastic carrier");
-    if (audit !== null) audit.forwardCalls += 1;
-    const weightData = weightContext === null ? null : incomingWeightData(incoming, weightContext.Cstar, weightContext.mode);
-    const coefficient = th.map((v, j) => (carrier === "axial" ? p.axial : p.leak / 2) * Math.exp(weightData === null ? v : v * weightData.weights[j]));
-    if (!coefficient.every(value => Number.isFinite(value) && value >= 0)) throw new Error(`nonlinear coefficient out of domain: theta=${JSON.stringify(th)} weights=${JSON.stringify(weightData === null ? null : weightData.weights)} coefficient=${JSON.stringify(coefficient)}`);
-    const tonic = carrier === "tonic" ? coefficient : null, cubic = carrier === "axial" ? coefficient : null;
-    const modulation = shuntModulation(input[0], input[1]);
-    const leak = [...modulation.map((m, j) => p.leak + eps * m + (tonic ? tonic[j] - p.leak / 2 : 0)), p.somaLeak];
-    assert.ok(leak.every(g => g > 0), "strictly dissipative leakage required");
-    function system(state) {
-      const drop = state.slice(0, 4).map(v => v - state[4]);
-      const edge = drop.map((d, j) => h * (p.axial + (cubic ? 3 * cubic[j] * d * d : 0)));
-      const diagonal = [...edge.map((g, j) => 1 + h * leak[j] + g), 1 + h * leak[4] + edge.reduce((sum, g) => sum + g, 0)];
-      return {drop, edge, diagonal};
-    }
-    const residual = state => {
-      if (audit !== null) audit.residualEvaluations += 1;
-      const flow = starFlow(state, input[0], input[1], eps, p.axial, 0, tonic, cubic);
-      return state.map((v, j) => v - incoming[j] - h * flow[j]);
-    };
-    let state = [...incoming], iterations = 0;
-    for (; iterations < 40 && norm(residual(state)) > tolerance; iterations++) {
-      const r = residual(state), sys = system(state), direction = response(sys.diagonal, sys.edge, r);
-      if (audit !== null) {
-        audit.responseCalls += 1;
-        audit.newtonResponseCalls += 1;
-      }
-      let accepted = false;
-      for (let backtrack = 0; backtrack < 24; backtrack++) {
-        const scale = 2 ** (-backtrack), next = state.map((v, j) => v - scale * direction[j]);
-        if (norm(residual(next)) < norm(r)) {
-          state = next;
-          accepted = true;
-          if (audit !== null) audit.backtrackSteps += backtrack;
-          break;
-        }
-      }
-      assert.ok(accepted, "implicit cell Newton step failed; no silent fallback");
-    }
-    if (audit !== null) audit.newtonIterations += iterations;
-    assert.ok(norm(residual(state)) <= tolerance, "implicit cell failed to converge");
-    if (weightData === null) return {state, ...system(state), coefficient, carrier, iterations, residual: norm(residual(state))};
-    return {state, ...system(state), coefficient, carrier, iterations, residual: norm(residual(state)), weights: weightData.weights, weightData};
-  }
+  // Reuse the shared five-state implicit dynamics and arrowhead response.  The
+  // legacy closure remains only as names/parameters for byte-stable checks.
+  const response = sharedResponse;
+  const event = sharedImplicitCell;
   function localCredit(cell, stateError, details = false, audit = null) {
     const errorVoltage = response(cell.diagonal, cell.edge, stateError);
     if (audit !== null) {
@@ -2082,11 +3002,29 @@ const rendered = JSON.stringify(selectiveCorrectionStageA ? {
   selectiveCorrectionQualification,
 } : output, null, 2) + "\n";
 if (selectiveCorrectionStageA) {
-  fs.writeFileSync("idea-stage/SELECTIVE_CORRECTION_CHECK_20260909.json", rendered, "utf8");
+  if (!noWriteLegacy) fs.writeFileSync("idea-stage/SELECTIVE_CORRECTION_CHECK_20260909.json", rendered, "utf8");
   if (!selectiveCorrectionQualification.correctnessPassed || !selectiveCorrectionQualification.scientificGatePassed) process.exitCode = 2;
 } else if (structureComputationOnly) {
   const structureRendered = JSON.stringify(output, null, 2) + "\n";
-  fs.writeFileSync("idea-stage/STRUCTURE_COMPUTATION_CHECK_20260909.json", structureRendered, "utf8");
+  if (!noWriteLegacy) fs.writeFileSync("idea-stage/STRUCTURE_COMPUTATION_CHECK_20260909.json", structureRendered, "utf8");
   if (!structureComputationQualification.correctnessPassed) process.exitCode = 1;
 }
 process.stdout.write(rendered);
+  }
+}
+
+module.exports = {
+  freeToken,
+  pairToken,
+  associationEnergy,
+  associationMargin,
+  coverageTeacher,
+  createOnlineState,
+  beginRelationPending,
+  consumeRelationPending,
+  distanceMargin: relationDistanceMargin,
+  runRelationEnergyCheck,
+  runRelationEnergySelectivityCheck,
+  sharedImplicitCell,
+  sharedResponse,
+};

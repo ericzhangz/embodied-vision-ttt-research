@@ -1,5 +1,7 @@
 # 选择性纠正 Goal：根因、单一计算改造与科学验收合同
 
+> **当前生效修订：2026-09-09 Pro 回传后的关联能量方案。** 用户已要求根据两份报告落实修改。当前数学对象和本轮施工范围改由 [CURRENT_IDEA_BRIEF.md](D:/EV-TTT/CURRENT_IDEA_BRIEF.md)、[§T 推导](D:/EV-TTT/DERIVATION_PACKAGE.md)及[本轮实施记录](D:/EV-TTT/refine-logs/RELATION_ENERGY_IMPLEMENTATION_20260909.md)规定。下文「立即交 Luna」和 §8 共享门控 handoff 属于历史版本，不再作为当前执行入口；\(w,C_*\) 和余弦读出退出当前候选。主旨、合法信息边界、完整候选导数、一次后继消费、匹配自身修正量及非微量行为验收仍保留。轻量数学与合成验证不等于科学目标完成，模拟继续暂缓。
+
 2026-09-09；规划/公式/静态分析：指定 gpt-6-astra high；实现与全部模型执行：原 gpt-5.6-luna max。状态依据 [新Goal路由](D:/EV-TTT/refine-logs/SELECTIVE_CORRECTION_GOAL_STATE_20260909.json)，不是旧 ACTIVE_RESEARCH_GOAL 或上一轮“小迭代完成”。本文件是运行前合同，不宣布新Goal完成。
 
 **用户最新范围调整：暂时不做模拟。** 当前推进根因、单一公式、必要轻量算术及同路径连续合成压力；模拟器/渲染视觉阶段标为“用户暂缓，未验证”。不要求现在取得数据，不再安排环境准备、下载或模拟；数据缺失不阻塞当前工作。固定具身视觉主旨及非微量、匹配预算、非cold特例的核心门槛不变。

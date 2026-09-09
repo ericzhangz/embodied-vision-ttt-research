@@ -1,115 +1,63 @@
 {
   "packId": "GPT_PRO_REVIEW_PACK_20260909",
-  "status": "complete",
+  "status": "updated",
   "createdOn": "2026-09-09",
-  "purpose": "Byte-preserving material package for GPT Pro review of the idea, derivation, arithmetic evidence, and claim boundary.",
-  "sourceRoot": "D:\\EV-TTT",
+  "updatedOn": "2026-09-09",
+  "purpose": "Current relation-energy research and diagnostic evidence, preserving all original package files.",
+  "repository": "https://github.com/ericzhangz/embodied-vision-ttt-research",
+  "visibility": "public",
+  "publicationAuthorization": "User explicitly confirmed continuing after the current public visibility was disclosed.",
+  "sourceRoot": "D:/EV-TTT",
   "provenancePolicy": {
     "sourcePathsAreProvenanceOnly": true,
     "sourcePathsAreNotProAccessibleLinks": true,
-    "sourceFilesWereNotEdited": true,
-    "AstraOwnedDocumentsNotTouched": [
-      "00_README_AND_PRO_PROMPT.md",
-      "02_THEORY_AND_DERIVATION.md",
-      "03_EVIDENCE_CHAIN_AND_LIMITS.md",
-      "04_OPEN_QUESTIONS_AND_CLAIM_LADDER.md"
-    ]
+    "sourceFilesWereNotEditedDuringPackaging": true,
+    "unchangedArtifactsCopiedByteForByte": true,
+    "historicalReadingBodiesPreserved": true,
+    "originalTrackedFilesRetained": true
   },
   "entries": [
     {
-      "sourcePath": "D:\\EV-TTT\\CURRENT_IDEA_BRIEF.md",
-      "packagePath": "01_CURRENT_IDEA_BRIEF.md",
-      "bytes": 9242,
-      "sha256": "30AEED7D140AD5942B63D5F1683199996F9154FB1035BF7EB19571CF3F43EE93",
-      "versionSemantics": "Current idea and computation brief; visual evidence remains unverified and the shared-query-gate proposal is not an aligned raw result."
-    },
-    {
       "sourcePath": null,
       "packagePath": "00_README_AND_PRO_PROMPT.md",
-      "role": "authored review doc",
-      "bytes": 5542,
-      "sha256": "8A38E39CB1FBD26A1AE93FC4E7168F99D27237FF357EC76CFFB8EBDB35C09430",
-      "versionSemantics": "Astra-authored GPT Pro reading guide and review prompt."
+      "bytes": 5856,
+      "sha256": "EC007697B9129273A0AC3A29DFE331EEEE07E5D0363672EE90E0FAFAA3862BDE",
+      "versionSemantics": "Historical review document with original body preserved and current-version notice prepended."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/CURRENT_IDEA_BRIEF.md",
+      "packagePath": "01_CURRENT_IDEA_BRIEF.md",
+      "bytes": 11141,
+      "sha256": "0A71CE6DD8F835950C86AB2AD369073150AFCAF80B25EACA425B51CFF121F486",
+      "versionSemantics": "Current relation-energy idea with matched-self-correction findings."
     },
     {
       "sourcePath": null,
       "packagePath": "02_THEORY_AND_DERIVATION.md",
-      "role": "authored review doc",
-      "bytes": 9563,
-      "sha256": "B0709ABCD30B1DC76CE4F9AD983CF9AF128FC127E6BD135014CF5818943C2A03",
-      "versionSemantics": "Astra-authored theory and derivation review document."
+      "bytes": 9839,
+      "sha256": "DC86477B65F003DFF0DCD9F11E2B8FBCF60F7172D305D92D37012B8E6639BFA5",
+      "versionSemantics": "Historical review document with original body preserved and current-version notice prepended."
     },
     {
       "sourcePath": null,
       "packagePath": "03_EVIDENCE_CHAIN_AND_LIMITS.md",
-      "role": "authored review doc",
-      "bytes": 8808,
-      "sha256": "70DB0AEF051E191E70FCF5921022D30703DD48C818734B8670B3DC769ABE1152",
-      "versionSemantics": "Astra-authored evidence-chain and claim-boundary review document."
+      "bytes": 9168,
+      "sha256": "A49F0F2954988B7B4034A950BC05FE6CE91612224B0592EEC98911FB39D72CC4",
+      "versionSemantics": "Historical review document with original body preserved and current-version notice prepended."
     },
     {
       "sourcePath": null,
       "packagePath": "04_OPEN_QUESTIONS_AND_CLAIM_LADDER.md",
-      "role": "authored review doc",
-      "bytes": 8897,
-      "sha256": "AF496728DB108FB0427CBB6B809828F40DB821BA88860293760E4E369195FB61",
-      "versionSemantics": "Astra-authored open-questions and claim-ladder review document."
+      "bytes": 9255,
+      "sha256": "9B07C48CCB4F65C0D8175A1461B86D2B30B7287BDCF03C44BBFA689B4D8F1C3B",
+      "versionSemantics": "Historical review document with original body preserved and current-version notice prepended."
     },
     {
-      "sourcePath": "D:\\EV-TTT\\refine-logs\\SELECTIVE_CORRECTION_GOAL_CONTRACT_20260909.md",
-      "packagePath": "references/SELECTIVE_CORRECTION_GOAL_CONTRACT_20260909.md",
-      "bytes": 40452,
-      "sha256": "AF3954F40BED29C46BC0CDE0C2F3DAFA1CD594B2D3C15A351FA99DE1864BDE4C",
-      "versionSemantics": "Full current contract, including the §8 shared query-gate handoff; source snapshot only."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\refine-logs\\SELECTIVE_CORRECTION_IMPLEMENTATION_20260909.md",
-      "packagePath": "references/SELECTIVE_CORRECTION_IMPLEMENTATION_20260909.md",
-      "bytes": 7606,
-      "sha256": "BF405C7C6D242595F9DB81345AC5A99479F89E31D0EE134D5B0020EB81609DE1",
-      "versionSemantics": "Historical implementation record for the independent Stage A gate; it does not document an aligned implementation."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\refine-logs\\EMBODIED_FIRST_NOVELTY_REVIEW_20260909.md",
-      "packagePath": "references/EMBODIED_FIRST_NOVELTY_REVIEW_20260909.md",
-      "bytes": 30286,
-      "sha256": "F2DC85C1E11B38A18949FE03F8FC9644E8BAB6C412A70474FB8EAE5D4E286EA9",
-      "versionSemantics": "Historical bounded embodied-vision novelty review; not a new literature search."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\refine-logs\\COMMON_CONTRAST_FOCUSED_NOVELTY_20260909.md",
-      "packagePath": "references/COMMON_CONTRAST_FOCUSED_NOVELTY_20260909.md",
-      "bytes": 12864,
-      "sha256": "FC8275AA56DD27CA9DED907697BFCFA7C9072DA7315F157C168ED6D7EBFFAA6C",
-      "versionSemantics": "Historical focused novelty note on common-contrast/contextual multiplicative mechanisms; not a new search."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\DERIVATION_PACKAGE.md",
-      "packagePath": "references/DERIVATION_PACKAGE.md",
-      "bytes": 157760,
-      "sha256": "11965304058294AAD899EB0D96C06DD6A97C3E87B180BE01D4D44974E2A99E98",
-      "versionSemantics": "Historical cumulative derivation package; it is not the latest main-equation entry point."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\idea-stage\\STRUCTURE_COMPUTATION_CHECK_20260909.json",
-      "packagePath": "evidence/STRUCTURE_COMPUTATION_CHECK_20260909.json",
-      "bytes": 12787777,
-      "sha256": "CE124DC26B855A5E96EB91BB0F812D89BC3C5BDA8839C4CF4B2F8C20691E6E56",
-      "versionSemantics": "Historical S/structure arithmetic raw output; old tested result, preserved without parsing or rewriting."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\idea-stage\\SELECTIVE_CORRECTION_CHECK_20260909.json",
-      "packagePath": "evidence/SELECTIVE_CORRECTION_CHECK_20260909.json",
-      "bytes": 2271531,
-      "sha256": "A874F4CB7C4F6FD51A72BC4E21E4B9777CD9E1D9C525E8670259493C2A278CBC",
-      "versionSemantics": "Independent Stage A gate raw output; measured under the prior per-route gate semantics, not a shared-query-gate result."
-    },
-    {
-      "sourcePath": "D:\\EV-TTT\\idea-stage\\CONSTRUCTIVE_COUPLING_CHECK_20260909.json",
-      "packagePath": "evidence/CONSTRUCTIVE_COUPLING_CHECK_20260909.json",
-      "bytes": 78490,
-      "sha256": "4A0AA4CAFD2310E0DCD6EA66FB718BD779CA05F0B8596A4A964B069C7A7609EB",
-      "versionSemantics": "Historical R/constructive-coupling arithmetic raw output; old 132-item tested result."
+      "sourcePath": "D:/EV-TTT/idea-stage/conductance_star_arithmetic_check.js",
+      "packagePath": "code/conductance_star_arithmetic_check.js",
+      "bytes": 274102,
+      "sha256": "5EBE5EF076D3CEB049D2CD4F2D121298EB97E4943C9376FAF75B3C3794B7041D",
+      "versionSemantics": "Current shared arithmetic path including relation energy, distance control, T1 and selectivity diagnostics; not a packaged runnable application."
     },
     {
       "sourcePath": "D:\\EV-TTT\\idea-stage\\ASSOCIATION_EVIDENCE_CREDIT_KILL_20260908.json",
@@ -119,30 +67,117 @@
       "versionSemantics": "Historical association-credit arithmetic raw output; old 118-item tested result."
     },
     {
-      "sourcePath": "D:\\EV-TTT\\idea-stage\\conductance_star_arithmetic_check.js",
-      "packagePath": "code/conductance_star_arithmetic_check.js",
-      "bytes": 174000,
-      "sha256": "FB3B7088A7A286FE99DFD8A68EA245851FE20FF67E3CA0AA38741398724D7629",
-      "versionSemantics": "Same starFlow arithmetic source containing the independent Stage A implementation; it is not an implementation of the shared-query-gate alignment."
+      "sourcePath": "D:\\EV-TTT\\idea-stage\\CONSTRUCTIVE_COUPLING_CHECK_20260909.json",
+      "packagePath": "evidence/CONSTRUCTIVE_COUPLING_CHECK_20260909.json",
+      "bytes": 78490,
+      "sha256": "4A0AA4CAFD2310E0DCD6EA66FB718BD779CA05F0B8596A4A964B069C7A7609EB",
+      "versionSemantics": "Historical R/constructive-coupling arithmetic raw output; old 132-item tested result."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/idea-stage/RELATION_ENERGY_CHECK_20260909.json",
+      "packagePath": "evidence/RELATION_ENERGY_CHECK_20260909.json",
+      "bytes": 45284,
+      "sha256": "8036D7E32A32DDE59FC55A370806F19DB9CAA904AD3EEE6095060214EDD24D50",
+      "versionSemantics": "T1 raw result, 18/18 arithmetic/interface groups; no visual capability claim."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/idea-stage/RELATION_ENERGY_SELECTIVITY_20260909.json",
+      "packagePath": "evidence/RELATION_ENERGY_SELECTIVITY_20260909.json",
+      "bytes": 6883934,
+      "sha256": "E56F0F3123DC623E804FA168618722B365082AF3321E9D3348441965D3364EF2",
+      "versionSemantics": "Raw 24-cell, two-method, three-target diagnostic; correctness true, scientific gate false."
+    },
+    {
+      "sourcePath": "D:\\EV-TTT\\idea-stage\\SELECTIVE_CORRECTION_CHECK_20260909.json",
+      "packagePath": "evidence/SELECTIVE_CORRECTION_CHECK_20260909.json",
+      "bytes": 2271531,
+      "sha256": "A874F4CB7C4F6FD51A72BC4E21E4B9777CD9E1D9C525E8670259493C2A278CBC",
+      "versionSemantics": "Independent Stage A gate raw output; measured under the prior per-route gate semantics, not a shared-query-gate result."
+    },
+    {
+      "sourcePath": "D:\\EV-TTT\\idea-stage\\STRUCTURE_COMPUTATION_CHECK_20260909.json",
+      "packagePath": "evidence/STRUCTURE_COMPUTATION_CHECK_20260909.json",
+      "bytes": 12787777,
+      "sha256": "CE124DC26B855A5E96EB91BB0F812D89BC3C5BDA8839C4CF4B2F8C20691E6E56",
+      "versionSemantics": "Historical S/structure arithmetic raw output; old tested result, preserved without parsing or rewriting."
+    },
+    {
+      "sourcePath": null,
+      "packagePath": "PACK_VERIFICATION.md",
+      "bytes": 2864,
+      "sha256": "4116D33EF1B259D4F7DCB0BD2EE2A381B28669C5A9DEB2FAEACF8786C233E1EC",
+      "versionSemantics": "Package documentation."
+    },
+    {
+      "sourcePath": null,
+      "packagePath": "README.md",
+      "bytes": 3292,
+      "sha256": "2080381F3941010330CCF4E7FB8B64CA48F826DE824A1BF8CE824E41B2F62BC3",
+      "versionSemantics": "Current repository reading guide and Pro research prompt."
+    },
+    {
+      "sourcePath": "D:\\EV-TTT\\refine-logs\\COMMON_CONTRAST_FOCUSED_NOVELTY_20260909.md",
+      "packagePath": "references/COMMON_CONTRAST_FOCUSED_NOVELTY_20260909.md",
+      "bytes": 12864,
+      "sha256": "FC8275AA56DD27CA9DED907697BFCFA7C9072DA7315F157C168ED6D7EBFFAA6C",
+      "versionSemantics": "Historical focused novelty note on common-contrast/contextual multiplicative mechanisms; not a new search."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/DERIVATION_PACKAGE.md",
+      "packagePath": "references/DERIVATION_PACKAGE.md",
+      "bytes": 164318,
+      "sha256": "1752E82EAF713C34AFBA5E409244F9302383CACB5B7496BD2C3794BB23781DCA",
+      "versionSemantics": "Current conditional relation-energy theory in section T; prior sections preserved."
+    },
+    {
+      "sourcePath": "D:\\EV-TTT\\refine-logs\\EMBODIED_FIRST_NOVELTY_REVIEW_20260909.md",
+      "packagePath": "references/EMBODIED_FIRST_NOVELTY_REVIEW_20260909.md",
+      "bytes": 30286,
+      "sha256": "F2DC85C1E11B38A18949FE03F8FC9644E8BAB6C412A70474FB8EAE5D4E286EA9",
+      "versionSemantics": "Historical bounded embodied-vision novelty review; not a new literature search."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/refine-logs/RELATION_ENERGY_IMPLEMENTATION_20260909.md",
+      "packagePath": "references/RELATION_ENERGY_IMPLEMENTATION_20260909.md",
+      "bytes": 11044,
+      "sha256": "F158136BEC16AEB47EBBBF053D1E74CA92299CE8C22D1070FC95D45013744F6A",
+      "versionSemantics": "Core implementation and T1 evidence; links to subsequent selectivity report."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/refine-logs/RELATION_ENERGY_SELECTIVITY_20260909.md",
+      "packagePath": "references/RELATION_ENERGY_SELECTIVITY_20260909.md",
+      "bytes": 12883,
+      "sha256": "5D0500D0B443FE37C15A85D80C845036924B4690A7EC60C30991CC01A0085F08",
+      "versionSemantics": "Frozen selectivity protocol, complete matched/unmatched results and mechanism limitations."
+    },
+    {
+      "sourcePath": "D:/EV-TTT/refine-logs/SELECTIVE_CORRECTION_GOAL_CONTRACT_20260909.md",
+      "packagePath": "references/SELECTIVE_CORRECTION_GOAL_CONTRACT_20260909.md",
+      "bytes": 41188,
+      "sha256": "683F0C72D7A1A39AB47FDE61C1574F371017E6A014EEF0DBA95728DE771784B9",
+      "versionSemantics": "Current version-routing notice; historical contract bodies preserved."
+    },
+    {
+      "sourcePath": "D:\\EV-TTT\\refine-logs\\SELECTIVE_CORRECTION_IMPLEMENTATION_20260909.md",
+      "packagePath": "references/SELECTIVE_CORRECTION_IMPLEMENTATION_20260909.md",
+      "bytes": 7606,
+      "sha256": "BF405C7C6D242595F9DB81345AC5A99479F89E31D0EE134D5B0020EB81609DE1",
+      "versionSemantics": "Historical implementation record for the independent Stage A gate; it does not document an aligned implementation."
     }
   ],
   "snapshotVerification": {
-    "entryCount": 11,
-    "allCopiedBytesEqual": true,
-    "allCopiedSHA256Equal": true,
-    "jsonHandling": "JSON files were copied as raw bytes and hash-checked; no JavaScript execution or JSON transformation was used for this snapshot.",
-    "sharedQueryGateRaw": "not_present",
-    "sharedQueryGateEvidenceStatus": "Specified in the current contract and idea brief, with no corresponding raw output in this package.",
-    "authoredReviewDocumentCount": 4,
-    "finalExpectedFileCount": 17,
+    "entryCount": 21,
+    "totalPackageFiles": 22,
+    "selectedSourceCopies": 8,
+    "allSelectedCopyHashesEqual": true,
     "manifestSelfHash": "omitted_to_avoid_circularity",
-    "verificationFile": "PACK_VERIFICATION.md"
+    "verificationFile": "PACK_VERIFICATION.md",
+    "currentEntryPoint": "README.md",
+    "jsonHandling": "Existing raw JSON bytes copied or retained without reserialization; no model execution during publication."
   },
   "excludedMaterials": [
-    "team-unpublished PDFs and private attachments",
-    "environment files, credentials, .pt files, GPU data, and personal data",
-    "any newly generated experiment output",
-    "any clone, install, upload, or external dataset"
+    "team-unpublished PDFs and private original attachments",
+    "credentials, environment files, weights, simulator assets and unrelated workspace files"
   ],
-  "nextStep": "User may upload or review this package; this task performs no experiment, model execution, or upload."
+  "evidenceBoundary": "Conditional synthetic arithmetic only. Primary target has no fully matched E sequence; no overall selectivity or visual superiority claim."
 }

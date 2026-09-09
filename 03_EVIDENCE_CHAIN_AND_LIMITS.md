@@ -1,5 +1,7 @@
 # 证据链、版本归属与结论边界
 
+> **历史证据链，正文保留。** 本文记录旧独立/共享门控阶段；当前源码已包含关联能量方案。新证据请读 [T1 实现记录](references/RELATION_ENERGY_IMPLEMENTATION_20260909.md)和[匹配修正检验](references/RELATION_ENERGY_SELECTIVITY_20260909.md)，不沿用本文的“源码仍是独立gate”作为当前状态。
+
 ## 1. 怎样定位与复算
 
 源码和原始量优先于摘要、测试数和叙事。[源码快照](code/conductance_star_arithmetic_check.js)仍是独立gate版本；当前query共享gate尚未实现，包中没有aligned运行JSON。对保存向量做内积/逐坐标乘法属于解析复算，不是执行新模型。完整性以[MANIFEST](MANIFEST.json)为准。
